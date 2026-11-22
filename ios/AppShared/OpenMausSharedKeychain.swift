@@ -6,45 +6,75 @@ import Security
 /// The access group is deliberately explicit on every operation. Omitting
 /// `kSecAttrAccessGroup` silently selects each target's private default group,
 /// which would make a token saved by the app invisible to the share extension.
+///
+/// A free Apple ID profile carries no keychain access group, so every call
+/// fails with `errSecMissingEntitlement`. Those failures, and a missing
+/// configuration, fall back to `OpenMausLocalTokenStore` so pairing still
+/// works in the sandbox even though extensions cannot share the token.
 enum OpenMausSharedKeychain {
     private static let service = "com.openmausbot.companion.token"
 
     static func save(_ token: String, for connectionID: String) throws {
-        let accessGroup = try requiredAccessGroup()
-        try save(
-            Data(token.utf8),
-            for: connectionID,
-            accessGroup: accessGroup
-        )
+        do {
+            let accessGroup = try requiredAccessGroup()
+            try save(
+                Data(token.utf8),
+                for: connectionID,
+                accessGroup: accessGroup
+            )
+        } catch {
+            guard isMissingEntitlement(error) else { throw error }
+            try OpenMausLocalTokenStore.save(token, for: connectionID)
+        }
     }
 
     /// The stored token: nil only when there genuinely is not one.
-    /// Locked or misconfigured keychains throw so callers never turn a
-    /// temporary inability to read protected data into an accidental unpair.
+    /// Locked keychains throw so callers never turn a temporary inability to
+    /// read protected data into an accidental unpair; an unavailable
+    /// entitlement instead falls back to the local token file.
     static func token(for connectionID: String) throws -> String? {
-        let accessGroup = try requiredAccessGroup()
-        return try readToken(for: connectionID, accessGroup: accessGroup)
+        do {
+            let accessGroup = try requiredAccessGroup()
+            return try readToken(for: connectionID, accessGroup: accessGroup)
+        } catch {
+            guard isMissingEntitlement(error) else { throw error }
+            return OpenMausLocalTokenStore.token(for: connectionID)
+        }
     }
 
     @discardableResult
     static func remove(_ connectionID: String) -> Bool {
+        let fileRemoved = OpenMausLocalTokenStore.remove(connectionID)
         guard let accessGroup = OpenMausSharedConfiguration.keychainAccessGroup else {
-            return false
+            return fileRemoved
         }
-        return remove(connectionID, accessGroup: accessGroup)
+        return remove(connectionID, accessGroup: accessGroup) && fileRemoved
     }
 
     /// Main-app upgrade path from the previous app-private keychain item.
     ///
-    /// The legacy item is deleted only after the shared item commits. If the
-    /// phone is locked or the new entitlement is unavailable, the old token
-    /// remains untouched and the error retains its locked-vs-missing meaning.
+    /// The legacy item is deleted only after the shared item commits, so a
+    /// locked keychain leaves the old token untouched and keeps its
+    /// locked-vs-missing meaning. An unavailable entitlement is instead
+    /// treated as "no legacy item" rather than an error, so a token already
+    /// living in the local file store is still used.
     static func tokenMigratingLegacyItem(for connectionID: String) throws -> String? {
         if let shared = try token(for: connectionID) { return shared }
-        let legacyGroup = try requiredLegacyAccessGroup()
-        guard let legacy = try readToken(for: connectionID, accessGroup: legacyGroup) else {
+        let legacyGroup: String
+        do {
+            legacyGroup = try requiredLegacyAccessGroup()
+        } catch {
+            guard isMissingEntitlement(error) else { throw error }
             return nil
         }
+        let legacy: String?
+        do {
+            legacy = try readToken(for: connectionID, accessGroup: legacyGroup)
+        } catch {
+            guard isMissingEntitlement(error) else { throw error }
+            legacy = nil
+        }
+        guard let legacy else { return nil }
         try save(legacy, for: connectionID)
         _ = remove(connectionID, accessGroup: legacyGroup)
         return legacy
@@ -57,10 +87,24 @@ enum OpenMausSharedKeychain {
     static func removeIncludingLegacyItem(_ connectionID: String) -> Bool {
         let sharedRemoved = remove(connectionID)
         guard let legacyGroup = OpenMausSharedConfiguration.legacyAppKeychainAccessGroup else {
-            return false
+            return sharedRemoved
         }
         let legacyRemoved = remove(connectionID, accessGroup: legacyGroup)
         return sharedRemoved && legacyRemoved
+    }
+
+    /// A free Apple ID profile has no keychain-access-groups entitlement, so
+    /// every `SecItem` call is refused before it can look at the item itself.
+    private static func isMissingEntitlement(_ error: Error) -> Bool {
+        guard let keychainError = error as? OpenMausSharedKeychainError else {
+            return false
+        }
+        switch keychainError {
+        case .configurationMissing:
+            return true
+        case let .security(status):
+            return status == errSecMissingEntitlement
+        }
     }
 
     private static func requiredAccessGroup() throws -> String {
@@ -149,7 +193,11 @@ enum OpenMausSharedKeychain {
         let status = SecItemDelete(
             identity(for: connectionID, accessGroup: accessGroup) as CFDictionary
         )
-        return status == errSecSuccess || status == errSecItemNotFound
+        // A missing entitlement means no item can exist in that group, so
+        // there is nothing left to delete rather than a failed deletion.
+        return status == errSecSuccess
+            || status == errSecItemNotFound
+            || status == errSecMissingEntitlement
     }
 }
 
