@@ -27,10 +27,23 @@ struct ChatView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
-    @State private var draft = ""
+    /// The composer's text. Held, not observed: a keystroke redraws the
+    /// composer (`DraftReader`) and leaves this body and the transcript be.
+    @State private var composerDraft = ComposerDraft()
+    /// Where the transcript rows' taps go (see `TranscriptRouter`).
+    @State private var router = TranscriptRouter()
+    /// The last render's reading of the thread, reused while it is unchanged.
+    @State private var snapshotMemo = TranscriptMemo()
     @State private var revealedMessageId: String?
     /// The reader has dragged this thread's transcript since it opened.
     @State private var readerScrolled = false
+    /// The reader scrolled the transcript themselves and has not come back to
+    /// its end: nothing scrolls it for them meanwhile. Known from the scroll
+    /// phase (iOS 18); below that, only from the end being out of view.
+    @State private var readerDetached = false
+    /// Where the transcript's end last sat, kept by reference so a scrolled
+    /// frame updates it without redrawing the screen.
+    @State private var scrollReading = ScrollReading()
     @State private var showingTasks = false
     @State private var showingComputer = false
     @State private var showingPlus = false
@@ -72,10 +85,15 @@ struct ChatView: View {
     /// a scroll offset, because iOS 16 has no scroll-position API.
     @State private var viewportBottom: CGFloat = 0
     @State private var showsJumpToLatest = false
+    /// VoiceOver has heard "… is typing" for this turn.
+    @State private var typingAnnounced = false
+    /// Bumped by a send: the transcript goes to its end, wherever the
+    /// reader had scrolled.
+    @State private var sendJumps = 0
 
     @AppStorage(PrefKey.islandIntro) private var islandIntro = IslandIntro.oncePerBot.rawValue
     @AppStorage(PrefKey.islandSeen) private var islandSeen = ""
-    @AppStorage(PrefKey.activityDetail) private var activityDetail = ActivityDetail.full.rawValue
+    @AppStorage(PrefKey.activityDetail) private var activityDetail = ActivityDetail.phoneDefault.rawValue
     @AppStorage(PrefKey.quickReplies) private var quickReplies = ""
 
     init(chat: Chat) {
@@ -92,6 +110,9 @@ struct ChatView: View {
     /// How far the end may sit below the screen before the pill appears — a
     /// small overscroll or a half-hidden last line is not scrollback.
     static let jumpToLatestThreshold: CGFloat = 160
+    /// How close to the end a scroll must come to rest for the transcript to
+    /// follow new messages again: at the end, give or take a line.
+    static let followSlack: CGFloat = 24
 
     /// The live chat record, so busy/unread stay current as frames land.
     private var current: Chat {
@@ -133,18 +154,108 @@ struct ChatView: View {
         session.state.visibleTranscript(forThread: threadId)
     }
 
+    /// The composer's text, for ChatView's own actions (send, switch
+    /// threads, dictation). Reading it here does not observe it.
+    private var draft: String {
+        get { composerDraft.text }
+        nonmutating set { composerDraft.text = newValue }
+    }
+
     /// The transcript as the reader has asked to see it: every chip, folded
     /// runs, or none at all.
-    private var rows: [TranscriptRow] {
-        transcriptRows(messages, detail: ActivityDetail(rawValue: activityDetail) ?? .full)
+    private var detail: ActivityDetail { ActivityDetail(rawValue: activityDetail) ?? .phoneDefault }
+
+    /// One render's reading of this thread. The session's branch walk ran
+    /// once per caller before (the rows, the live narration twice, the
+    /// status line, the approval check): now once, shared by all of them.
+    private struct TranscriptSnapshot {
+        /// The visible branch the rows were folded from.
+        let messages: [Message]
+        let rows: [TranscriptRow]
+        let versions: [String?: [Message]]
+        /// At Hidden, what a working bot has said so far in this turn: left
+        /// out of the transcript and shown as one grey status line instead.
+        let live: LiveNarration
+        let hasPendingApproval: Bool
+    }
+
+    /// Reused while the thread, its messages, the bot's busy flag and the
+    /// Activity setting are unchanged — which is every publish about another
+    /// thread. Reuse is the point, not just the saved work: the rows are
+    /// then the same arrays as last time, so each row's values are identical
+    /// to the last render's (see `TranscriptRouter`).
+    private var transcriptSnapshot: TranscriptSnapshot {
+        let messages = self.messages
+        let all = session.state.transcript(forThread: threadId)
+        let busy = current.busy
+        let detail = detail
+        let key = TranscriptMemo.Key(threadId: threadId, busy: busy, detail: detail)
+        if let reused = snapshotMemo.snapshot(for: key, messages: messages, all: all) { return reused }
+        let live = liveNarration(messages, busy: busy, detail: detail)
+        let shown = live.hiddenIds.isEmpty ? messages : messages.filter { !live.hiddenIds.contains($0.id) }
+        let snapshot = TranscriptSnapshot(
+            messages: messages,
+            rows: transcriptRows(shown, detail: detail),
+            versions: session.state.userMessageVersions(inThread: threadId),
+            live: live,
+            hasPendingApproval: messages.contains { $0.card?.isPending == true }
+        )
+        snapshotMemo.remember(snapshot, for: key, messages: messages, all: all)
+        return snapshot
+    }
+
+    /// The last `TranscriptSnapshot` and what it was read from. A cache held
+    /// by reference: filling it is not a change anything should redraw for.
+    private final class TranscriptMemo {
+        struct Key: Equatable {
+            let threadId: String
+            let busy: Bool
+            let detail: ActivityDetail
+        }
+
+        private var key: Key?
+        private var messages: [Message] = []
+        private var all: [Message] = []
+        private var snapshot: TranscriptSnapshot?
+
+        /// An unforked thread's branch is its stored array, so while nothing
+        /// arrives in it these compare by identity, not message by message.
+        func snapshot(for key: Key, messages: [Message], all: [Message]) -> TranscriptSnapshot? {
+            guard key == self.key, messages == self.messages, all == self.all else { return nil }
+            return snapshot
+        }
+
+        func remember(_ snapshot: TranscriptSnapshot, for key: Key, messages: [Message], all: [Message]) {
+            self.key = key
+            self.messages = messages
+            self.all = all
+            self.snapshot = snapshot
+        }
+    }
+
+    private var rows: [TranscriptRow] { transcriptSnapshot.rows }
+
+    /// The transcript ends with the typing bubble: busy, not waiting on you,
+    /// and the last row on screen is not a finished reply (`TurnTail`). A
+    /// stream bubble takes the slot instead where the detail level shows one.
+    private func showsTyping(_ snapshot: TranscriptSnapshot) -> Bool {
+        let streaming = !(session.state.streaming[threadId] ?? "").isEmpty
+            || !(session.state.reasoning[threadId] ?? "").isEmpty
+        return current.showsTyping(messages: snapshot.messages, hiddenIds: snapshot.live.hiddenIds, streaming: streaming)
+    }
+
+    /// The status line's words: the reply as it streams, else the newest
+    /// in-between message. Nil unless Hidden and the bot is working.
+    private func liveStatusLine(_ snapshot: TranscriptSnapshot) -> String? {
+        guard current.busy, detail == .hidden else { return nil }
+        if let streaming = session.state.streaming[threadId], !streaming.isEmpty {
+            return String(streaming.suffix(240))
+        }
+        return snapshot.live.latest
     }
 
     /// The composer's chip row, as edited in Settings.
-    private var storedChips: [ActionChipItem] {
-        QuickReply.decode(quickReplies).map {
-            ActionChipItem(id: $0.id, title: $0.title, icon: $0.icon, prompt: $0.prompt)
-        }
-    }
+    private var storedChips: [ActionChipItem] { StoredChips.chips(quickReplies) }
 
     /// Unread elsewhere — what the back pill's badge counts, like Messages.
     private var unreadElsewhere: Int {
@@ -156,8 +267,7 @@ struct ChatView: View {
         // Read the transcript once for this render. Pagination changes the
         // array as a unit; repeatedly reaching through ObservableObject for
         // every row only recomputes the same value.
-        let transcript = rows
-        let versions = session.state.userMessageVersions(inThread: threadId)
+        let snapshot = transcriptSnapshot
         // A VStack with the composer as a sibling, rather than a scroll view
         // with `.safeAreaInset`. The inset version sized itself to its
         // content, so a short transcript left the composer floating in the
@@ -165,275 +275,17 @@ struct ChatView: View {
         // explicitly told to take everything the composer does not.
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
-                ScrollView {
-                    // VStack, not LazyVStack. A lazy stack does not know how
-                    // tall it is until its rows have been built, so
-                    // `.defaultScrollAnchor(.bottom)` anchors against an
-                    // estimate and the chat opens somewhere in the middle of
-                    // the conversation. Building all of it up front makes the
-                    // height exact and the anchor land on the newest message.
-                    // A thread holds 50 messages until you ask for more, so
-                    // there is nothing here worth being lazy about.
-                    VStack(alignment: .leading, spacing: 6) {
-                        // room for the floating face when scrolled to the top
-                        Color.clear.frame(height: 72)
-
-                        if session.state.hasMore[threadId] == true {
-                            Button("Load earlier messages") {
-                                // keep the reader where they were: after older
-                                // messages are prepended, sit back on the one
-                                // that used to be at the top
-                                let anchor = transcript.first?.id
-                                Task {
-                                    await session.loadOlder(threadId: threadId)
-                                    if let anchor { proxy.scrollTo(anchor, anchor: .top) }
-                                }
-                            }
-                            .font(.footnote)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                        }
-
-                        ForEach(Array(transcript.enumerated()), id: \.element.id) { index, row in
-                            VStack(alignment: .leading, spacing: 6) {
-                                // a gap in time is worth marking; a timestamp
-                                // on every message is just noise
-                                if startsANewStretch(at: index, in: transcript) {
-                                    Text(RelativeStamp.separator(row.head.date))
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(Color.secondary.opacity(0.7))
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.top, 10)
-                                        .padding(.bottom, 4)
-                                }
-                                switch row {
-                                case let .message(message):
-                                    MessageRow(
-                                        chat: current,
-                                        message: message,
-                                        versions: message.role == .user && message.kind == .text
-                                            ? versions[message.parentId] ?? [] : [],
-                                        endsRun: endsRun(at: index, in: transcript),
-                                        openLink: openLink,
-                                        openThread: openThread
-                                    )
-                                case let .activityRun(items):
-                                    ActivityRunChip(items: items, openThread: openThread)
-                                case let .assistantTurn(turn):
-                                    AssistantTurnChip(
-                                        turn: turn, chat: current, openLink: openLink, openThread: openThread,
-                                        revealedMessageId: revealedMessageId,
-                                        scrollToMessage: { proxy.scrollTo($0, anchor: .center) }
-                                    )
-                                }
-                            }
-                            .id(row.id)
-                        }
-
-                        // The reply as it is typed. It sits after the last
-                        // settled message and disappears the moment the real
-                        // one arrives — the store clears it on the same frame
-                        // that appends the message, so there is never a beat
-                        // where both are on screen.
-                        if current.busy, let live = session.state.streaming[threadId], !live.isEmpty {
-                            StreamingBubble(text: live, reasoning: nil, color: current.color)
-                                .id(Self.liveBubbleId)
-                        } else if current.busy, activityDetail != ActivityDetail.hidden.rawValue,
-                                  let thinking = session.state.reasoning[threadId], !thinking.isEmpty {
-                            // Only while there is no answer yet. Once tokens
-                            // of the reply exist, the reasoning is behind us
-                            // and showing both is just noise.
-                            StreamingBubble(text: nil, reasoning: thinking, color: current.color)
-                                .id(Self.liveBubbleId)
-                        } else if current.busy {
-                            TypingIndicatorView(tintColor: MausPalette.color(current.color))
-                                .id(Self.liveBubbleId)
-                                .accessibilityLabel("\(current.name) is working")
-                        }
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id(Self.transcriptEndId)
-                            // Only a change of answer touches state: this
-                            // fires on every scrolled frame.
-                            .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { end in
-                                let reading = end - viewportBottom > Self.jumpToLatestThreshold
-                                if reading != showsJumpToLatest {
-                                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { showsJumpToLatest = reading }
-                                }
-                            }
-                            .accessibilityHidden(true)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: CompanionLayout.chatWidth, alignment: .leading)
-                    .frame(maxWidth: .infinity)
-                }
-                // The header lives in the scroll view's top safe area: the
-                // transcript starts below it and scrolls under it — that is
-                // what the glass is for. An inset rather than a content
-                // margin, because `.defaultScrollAnchor(.bottom)` anchored
-                // unreliably against a margin and opened chats mid-way.
-                // The blur is only the top strip — back, computer — the way
-                // a system bar is; the transcript starts on that line and
-                // scrolls under the face and name, which float over it.
-                .safeAreaInset(edge: .top, spacing: 0) { headerBar }
-                .overlay(alignment: .top) { headerFace }
-                .overlay(alignment: .top) {
-                    // One face, in one layer, measured from the screen's top
-                    // edge: it sits in the island while that is open and
-                    // glides into its header slot when the island lets go.
-                    let topInset = IslandGeometry.topInset
-                    let islandSide: CGFloat = 220
-                    // centred in the part of the square the hardware island does not cover
-                    let islandFaceCentre = IslandGeometry.top + IslandGeometry.size.height + (islandSide - IslandGeometry.size.height) / 2
-                    let headerFaceCentre = topInset + 26
-                    let faceSize = 60 + 72 * facePhase
-                    let faceCentre = headerFaceCentre + (islandFaceCentre - headerFaceCentre) * facePhase
-                    ZStack(alignment: .top) {
-                        if islandVisible {
-                            IslandShell(expanded: islandExpanded, expandedSize: CGSize(width: islandSide, height: islandSide)) {
-                                Color.clear
-                            }
-                        }
-                        ChatAvatarView(chat: current, size: faceSize, state: MausState.forChat(current, in: session.state), animated: MausState.forChat(current, in: session.state).showsActivity || islandExpanded, comets: islandExpanded)
-                            .offset(y: faceCentre - faceSize / 2)
-                            .allowsHitTesting(false)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .top)
-                    .ignoresSafeArea(edges: .top)
-                    .allowsHitTesting(false)
-                }
-                // Reading scrollback — one tap back to the end, streaming or
-                // not, the same pill the desktop chat offers.
-                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { bottom in
-                    viewportBottom = bottom
-                }
-                .overlay(alignment: .bottom) {
-                    if showsJumpToLatest {
-                        Button {
-                            withAnimation { proxy.scrollTo(Self.transcriptEndId, anchor: .bottom) }
-                        } label: {
-                            Label("Jump to latest", systemImage: "arrow.down")
-                                .font(.footnote.weight(.medium))
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(.regularMaterial, in: Capsule())
-                                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08)))
-                                .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Jump to latest messages")
-                        .padding(.bottom, 10)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                    }
-                }
-                .task {
-                    // grow, hold a beat, shrink — the face rides along
-                    guard CompanionLayout.supportsIslandPresentation, !reduceMotion else { return }
-                    // The intro is a greeting, and a greeting repeated every
-                    // time you open a chat stops being one.
-                    let intro = IslandIntro(rawValue: islandIntro) ?? .oncePerBot
-                    switch intro {
-                    case .never:
-                        return
-                    case .oncePerBot:
-                        guard !IslandSeen.contains(islandIntroID, in: islandSeen) else { return }
-                        islandSeen = IslandSeen.adding(islandIntroID, to: islandSeen)
-                    case .always:
-                        break
-                    }
-                    islandVisible = true
-                    try? await Task.sleep(for: .milliseconds(40))
-                    withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) { islandExpanded = true; facePhase = 1 }
-                    try? await Task.sleep(for: .milliseconds(1000))
-                    withAnimation(.spring(response: 0.55, dampingFraction: 0.82)) { islandExpanded = false; facePhase = 0 }
-                    try? await Task.sleep(for: .milliseconds(600))
-                    islandVisible = false
-                }
-                // A conversation grows from the bottom: a transcript shorter
-                // than the screen rests at the bottom, and opening a chat
-                // starts on the newest message rather than the oldest.
-                .scrollAnchorCompat(.bottom)
-                // Tapping the transcript puts the keyboard away. The composer
-                // is a sibling of this scroll view rather than inside it, so
-                // nothing else here drops its focus — until this, the only way
-                // back to the whole conversation was to leave the chat.
-                // Simultaneous, not `.onTapGesture`: a tap that lands on a
-                // link, a card button or a selected word still reaches the row
-                // that owns it, and only also closes the keyboard.
-                .simultaneousGesture(TapGesture().onEnded {
-                    if composerFocused { composerFocused = false }
-                })
-                // And a drag down over the transcript pushes it away, the way
-                // it does in Mail and Messages.
-                .scrollDismissesKeyboard(.interactively)
-                // `initial: true` is what opens the chat on the newest
-                // message where `scrollAnchorCompat` cannot (iOS 16). On 17 the
-                // anchor has already put us there and this is a no-op.
-                .onValueChange(of: transcript.last?.id, initial: true) { _ in
-                    guard let last = transcript.last else { return }
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
-                // Neither of the above is enough on its own when the newest
-                // message holds a table or a code block. Their horizontal
-                // scroll views throw off the height the anchor measures on
-                // the first pass, so the chat opened a table's height short
-                // of the end; and the `initial` scroll above runs before
-                // there is anything to scroll. One more scroll once the first
-                // layout has settled lands on the end — again when the page
-                // arrives from the computer, which can be after the push,
-                // unless the reader has already scrolled away to read.
-                .task(id: "\(threadId)|\(session.state.hasLoadedPage(forThread: threadId))") {
-                    try? await Task.sleep(for: .milliseconds(50))
-                    guard !Task.isCancelled, !readerScrolled, let last = rows.last else { return }
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
-                .onUserScrollCompat { readerScrolled = true }
-                // Follow the text as it arrives. Keyed on length rather than
-                // the string so this fires once per delta batch, and without
-                // animation — animating every token turns a smooth stream
-                // into a stutter, because each scroll interrupts the last.
-                .onValueChange(of: session.state.streaming[threadId]?.count ?? 0) { length in
-                    guard length > 0 else { return }
-                    proxy.scrollTo(Self.liveBubbleId, anchor: .bottom)
-                }
-                .task(id: session.focusedMessageId) {
-                    guard let messageId = session.focusedMessageId,
-                          messages.contains(where: { $0.id == messageId })
-                    else { return }
-                    revealedMessageId = messageId
-                    // Materialize the lazy folded row first. Its target bubble
-                    // scrolls itself into view once expansion has laid it out.
-                    let folded = transcript.first { row in
-                        if case let .assistantTurn(turn) = row {
-                            return turn.messages.contains { $0.id == messageId }
-                        }
-                        return false
-                    }
-                    proxy.scrollTo(folded?.id ?? messageId, anchor: .center)
-                    session.consumeFocus(messageId)
-                }
+                transcriptScrollView(proxy: proxy, snapshot: snapshot)
             }
             .id(threadId)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             liveCallBars
-            composer
+            composer(snapshot)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .overlay(alignment: .bottom) { plusSheet }
-        .overlay(alignment: .bottomTrailing) {
-#if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("-busy-fleet-preview") {
-                Text("Offline busy-fleet fixture")
-                    .font(.caption2)
-                    .allowsHitTesting(false)
-                    .accessibilityIdentifier("busy-fleet-progress")
-                    .accessibilityValue(session.state.cursor ?? "0")
-            }
-#endif
-        }
+        .overlay(alignment: .bottomTrailing) { busyFleetFixtureBadge }
         .toolbar(.hidden, for: .navigationBar)
         .navigationBarBackButtonHidden(true)
         // Hiding the bar above also disarms the system edge-swipe back
@@ -444,64 +296,31 @@ struct ChatView: View {
         .navigationDestination(isPresented: $showingComputer) {
             if case let .bot(bot) = current { ComputerView(bot: bot) }
         }
-        .task(id: threadId) {
-            if selectedThreadWasRemoved { dismiss(); return }
-            let openedChat = current
-            session.threadSelection.rememberThread(openedChat, connectionID: session.connection?.id)
-            await session.loadThreadIfNeeded(openedChat.threadId)
-            // opening a chat is what marks it read, exactly as on the desktop
-            if openedChat.unread { await session.markRead(openedChat) }
-#if DEBUG
-            // `-open-plus`: the + sheet up, for the screenshot harness
-            if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
-            // Profile parity screenshots without automating a tap through the
-            // animated island/header transition.
-            if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
-#endif
-        }
+        .task(id: threadId) { await enterThread() }
         .onValueChange(of: selectedThreadWasRemoved) { removed in
             if removed { dismiss() }
         }
         .onValueChange(of: session.state.hasLoadedPage(forThread: threadId)) { loaded in
-            let requestedThread = threadId
-            if !loaded { Task { await session.loadThreadIfNeeded(requestedThread) } }
+            reloadIfPageDropped(loaded)
         }
-        .onValueChange(of: current.unread) { unread in
-            // A message can arrive while this chat is already on screen. The
-            // initial task above will not run again, so clear that new unread
-            // bit here rather than leaving a badge on an open conversation.
-            let readChat = current
-            if unread { Task { await session.markRead(readChat) } }
-        }
-        .onValueChangePair(of: threadId) { previous, next in
-            dictation.stop()
-            threadDrafts[previous] = ComposerSnapshot(text: draft, attachments: attachments, error: attachmentError)
-            let restored = threadDrafts.removeValue(forKey: next) ?? ComposerSnapshot()
-            draft = restored.text
-            attachments = restored.attachments
-            attachmentError = restored.error
-            selectedPhotos = []
-            showCommandHUD = false
-            showingPlus = false
-            readerScrolled = false
-            // The local task picker changed threads. A download
-            // started in the previous task must not open a sheet (or surface
-            // its error) in the new one when the network reply arrives late.
-            resetFilePreview()
-            cancelThreadOpen()
-        }
+        .onValueChange(of: current.unread) { unread in markReadIfNeeded(unread) }
+        .onValueChangePair(of: threadId) { previous, next in switchThread(from: previous, to: next) }
         .onValueChange(of: session.connection?.id) { _ in
             steering = false
             cancelThreadOpen()
         }
         .onValueChange(of: heldSends.first?.queueId) { _ in steering = false }
-        .onValueChange(of: current.busy) { busy in if !busy { steering = false } }
-        .onValueChange(of: threadId) { _ in steering = false }
-        .task(id: steering) {
-            guard steering else { return }
-            try? await Task.sleep(for: .seconds(20))
-            if !Task.isCancelled { steering = false }
+        .onValueChange(of: current.busy) { busy in
+            if !busy {
+                steering = false
+                typingAnnounced = false
+            }
         }
+        .onValueChange(of: threadId) { _ in
+            steering = false
+            typingAnnounced = false
+        }
+        .task(id: steering) { await expireSteering() }
         .onDisappear {
             dictation.stop()
             resetFilePreview()
@@ -523,11 +342,7 @@ struct ChatView: View {
             if shown { dictation.stop() }
         }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { note in
-            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey]
-            let value = (raw as? NSNumber)?.uintValue ?? (raw as? UInt)
-            if value == AVAudioSession.InterruptionType.began.rawValue {
-                dictation.stop()
-            }
+            stopDictation(ifInterruptedBy: note)
         }
         .onValueChange(of: dictation.transcript) { spoken in
             // Always join against the text frozen at capture start. A newer
@@ -588,6 +403,492 @@ struct ChatView: View {
                 startLiveCall(bot)
             }
         }
+    }
+
+    // MARK: - Transcript
+
+    /// The transcript: its rows, the live tail, the header and face that
+    /// float over it, and the scrolling that keeps the newest message in view.
+    private func transcriptScrollView(proxy: ScrollViewProxy, snapshot: TranscriptSnapshot) -> some View {
+        let transcript = snapshot.rows
+        let actions = transcriptActions(proxy)
+        return ScrollView {
+            transcriptColumn(proxy: proxy, snapshot: snapshot, actions: actions)
+        }
+        // The header lives in the scroll view's top safe area: the
+        // transcript starts below it and scrolls under it — that is
+        // what the glass is for. An inset rather than a content
+        // margin, because `.defaultScrollAnchor(.bottom)` anchored
+        // unreliably against a margin and opened chats mid-way.
+        // The blur is only the top strip — back, computer — the way
+        // a system bar is; the transcript starts on that line and
+        // scrolls under the face and name, which float over it.
+        .safeAreaInset(edge: .top, spacing: 0) { headerBar }
+        .overlay(alignment: .top) { headerFace }
+        .overlay(alignment: .top) { floatingFace }
+        // Reading scrollback — one tap back to the end, streaming or
+        // not, the same pill the desktop chat offers.
+        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { bottom in
+            viewportBottom = bottom
+        }
+        .overlay(alignment: .bottom) { jumpToLatestPill(proxy) }
+        .task { await playIslandIntro() }
+        // A conversation grows from the bottom: a transcript shorter
+        // than the screen rests at the bottom, and opening a chat
+        // starts on the newest message rather than the oldest.
+        .scrollAnchorCompat(.bottom)
+        // Tapping the transcript puts the keyboard away. The composer
+        // is a sibling of this scroll view rather than inside it, so
+        // nothing else here drops its focus — until this, the only way
+        // back to the whole conversation was to leave the chat.
+        // Simultaneous, not `.onTapGesture`: a tap that lands on a
+        // link, a card button or a selected word still reaches the row
+        // that owns it, and only also closes the keyboard.
+        .simultaneousGesture(TapGesture().onEnded {
+            if composerFocused { composerFocused = false }
+        })
+        // And a drag down over the transcript pushes it away, the way
+        // it does in Mail and Messages.
+        .scrollDismissesKeyboard(.interactively)
+        .modifier(FollowsLatest(
+            proxy: proxy,
+            lastRowId: transcript.last?.id,
+            streamLength: session.state.streaming[threadId]?.count ?? 0,
+            // Read from the last layout, before this update's rows are
+            // laid out: a tall new row that pushes the end off screen is
+            // the transcript growing, not the reader leaving.
+            follows: !readerDetached && !showsJumpToLatest,
+            typing: showsTyping(snapshot),
+            sendJumps: sendJumps,
+            reduceMotion: reduceMotion
+        ))
+        // Neither of the above is enough on its own when the newest
+        // message holds a table or a code block. Their horizontal
+        // scroll views throw off the height the anchor measures on
+        // the first pass, so the chat opened a table's height short
+        // of the end; and the `initial` scroll above runs before
+        // there is anything to scroll. One more scroll once the first
+        // layout has settled lands on the end — again when the page
+        // arrives from the computer, which can be after the push,
+        // unless the reader has already scrolled away to read.
+        .task(id: "\(threadId)|\(session.state.hasLoadedPage(forThread: threadId))") {
+            await settleOnEnd(proxy)
+        }
+        // iOS 18 says when the reader starts and stops scrolling; below
+        // that the transcript stops following only once its end is out of
+        // view (`showsJumpToLatest`).
+        .onUserScrollCompat { scrolling in readerScroll(scrolling) }
+        .task(id: session.focusedMessageId) { revealFocusedMessage(proxy, in: transcript) }
+    }
+
+    /// The rows, then whatever is live, then the end marker.
+    private func transcriptColumn(
+        proxy: ScrollViewProxy, snapshot: TranscriptSnapshot, actions: TranscriptActions
+    ) -> some View {
+        let transcript = snapshot.rows
+        let shared = RowShared(
+            context: rowContext,
+            today: RosterDay.today,
+            pendingEditId: session.state.pendingEdits[threadId]?.placeholderId,
+            versions: snapshot.versions,
+            actions: actions
+        )
+        // VStack, not LazyVStack. A lazy stack does not know how
+        // tall it is until its rows have been built, so
+        // `.defaultScrollAnchor(.bottom)` anchors against an
+        // estimate and the chat opens somewhere in the middle of
+        // the conversation. Building all of it up front makes the
+        // height exact and the anchor land on the newest message.
+        // A thread holds 50 messages until you ask for more, so
+        // there is nothing here worth being lazy about. Each row is
+        // `.equatable()` on the values it draws: a publish or a
+        // keystroke that changes none of them does not redraw it.
+        return VStack(alignment: .leading, spacing: 6) {
+            // room for the floating face when scrolled to the top
+            Color.clear.frame(height: 72)
+
+            if session.state.hasMore[threadId] == true {
+                loadEarlierButton(proxy: proxy, transcript: transcript)
+            }
+
+            ForEach(Array(transcript.enumerated()), id: \.element.id) { index, row in
+                rowView(row, at: index, in: transcript, shared: shared)
+                    .equatable()
+                    .id(row.id)
+            }
+
+            liveTail(snapshot)
+            transcriptEnd
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: CompanionLayout.chatWidth, alignment: .leading)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func loadEarlierButton(proxy: ScrollViewProxy, transcript: [TranscriptRow]) -> some View {
+        Button("Load earlier messages") {
+            // keep the reader where they were: after older
+            // messages are prepended, sit back on the one
+            // that used to be at the top
+            let anchor = transcript.first?.id
+            Task {
+                await session.loadOlder(threadId: threadId)
+                if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+            }
+        }
+        .font(.footnote)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+    }
+
+    /// What every row of one render shares.
+    private struct RowShared {
+        let context: TranscriptRowContext
+        let today: Date
+        let pendingEditId: String?
+        let versions: [String?: [Message]]
+        let actions: TranscriptActions
+    }
+
+    /// The chat-wide values the rows draw from, read once per render
+    /// rather than once per row.
+    private var rowContext: TranscriptRowContext {
+        let chat = current
+        var bot: Bot?
+        if case let .bot(value) = chat { bot = value }
+        let connection = session.connection
+        return TranscriptRowContext(
+            threadId: chat.threadId,
+            name: chat.name,
+            color: chat.color,
+            botId: bot?.id,
+            busy: bot?.busy == true,
+            editPending: session.state.pendingEdits[chat.threadId] != nil,
+            claudeInstanceId: bot?.currentTaskModelSelection.instanceId,
+            credentials: CredentialAccess(
+                connectionId: connection?.id,
+                pairedForSecrets: connection.map { $0.secretPublicKey != nil && $0.companionDeviceId != nil } ?? false,
+                transportProtected: session.phoneCredentialTransportIsProtected,
+                status: session.status,
+                resetGeneration: session.credentialEntryResetGeneration
+            )
+        )
+    }
+
+    /// One row as plain values. The per-row lookups that used to happen in
+    /// the row's own body (its pending edit, its routine's thread) happen
+    /// here, once, so the row never reads the session.
+    private func rowView(
+        _ row: TranscriptRow, at index: Int, in transcript: [TranscriptRow], shared: RowShared
+    ) -> TranscriptRowView {
+        var versions: [Message] = []
+        var routineRun: ThreadRef?
+        var revealed: String?
+        switch row {
+        case let .message(message):
+            if message.role == .user, message.kind == .text { versions = shared.versions[message.parentId] ?? [] }
+            if message.kind == .routineRun, let card = message.routineRun {
+                routineRun = session.state.routineExecutionRef(for: card)
+            }
+        case let .assistantTurn(turn):
+            if let id = revealedMessageId, turn.messages.contains(where: { $0.id == id }) { revealed = id }
+        case .activityRun:
+            break
+        }
+        return TranscriptRowView(
+            row: row,
+            stamp: startsANewStretch(at: index, in: transcript) ? row.head.date : nil,
+            today: shared.today,
+            endsRun: endsRun(at: index, in: transcript),
+            versions: versions,
+            isPendingEdit: shared.pendingEditId == row.id,
+            routineRun: routineRun,
+            context: shared.context,
+            revealedMessageId: revealed,
+            actions: shared.actions
+        )
+    }
+
+    /// What the rows may ask of this screen: a value that is the same from
+    /// render to render. Binding the router here, rather than when the
+    /// transcript appears, means it is bound before any row's own `onAppear`
+    /// asks something of it; the router is a plain reference, so binding it
+    /// redraws nothing.
+    private func transcriptActions(_ proxy: ScrollViewProxy) -> TranscriptActions {
+        router.bind(liveChat: { current }, navigate: { navigate($0, proxy: proxy) })
+        return TranscriptActions(threadId: threadId, session: session, router: router)
+    }
+
+    private func navigate(_ request: TranscriptNavigation, proxy: ScrollViewProxy) {
+        switch request {
+        case let .thread(ref):
+            openThread(ref)
+        case let .file(path, messageId):
+            openFile(path: path, messageId: messageId)
+        case .refusedLink:
+            fileOpenError = "This link can't be opened securely."
+        case let .reveal(messageId):
+            proxy.scrollTo(messageId, anchor: .center)
+        }
+    }
+
+    /// The reply as it is typed. It sits after the last settled message and
+    /// disappears the moment the real one arrives — the store clears it on
+    /// the same frame that appends the message, so there is never a beat
+    /// where both are on screen.
+    /// At Hidden the words go to the status line above the composer; the
+    /// transcript keeps the typing bubble, which says the bot is still on it.
+    @ViewBuilder private func liveTail(_ snapshot: TranscriptSnapshot) -> some View {
+        if current.busy, detail != .hidden, let live = session.state.streaming[threadId], !live.isEmpty {
+            StreamingBubble(text: live, reasoning: nil, color: current.color)
+                .id(Self.liveBubbleId)
+        } else if current.busy, activityDetail != ActivityDetail.hidden.rawValue,
+                  let thinking = session.state.reasoning[threadId], !thinking.isEmpty {
+            // Only while there is no answer yet. Once tokens
+            // of the reply exist, the reasoning is behind us
+            // and showing both is just noise.
+            StreamingBubble(text: nil, reasoning: thinking, color: current.color)
+                .id(Self.liveBubbleId)
+        } else if showsTyping(snapshot) {
+            TypingIndicatorView(name: current.name)
+                .id(Self.liveBubbleId)
+                .onAppear(perform: announceTyping)
+        }
+    }
+
+    /// VoiceOver hears "Pepper is typing" once a turn, when the bubble first
+    /// appears. It comes and goes between steps, and saying it every time
+    /// would be noise.
+    private func announceTyping() {
+        guard !typingAnnounced else { return }
+        typingAnnounced = true
+        guard UIAccessibility.isVoiceOverRunning else { return }
+        UIAccessibility.post(notification: .announcement, argument: String(localized: "\(current.name) is typing"))
+    }
+
+    private var transcriptEnd: some View {
+        Color.clear
+            .frame(height: 1)
+            .id(Self.transcriptEndId)
+            // Only a change of answer touches state: this
+            // fires on every scrolled frame.
+            .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { end in
+                noteTranscriptEnd(end)
+            }
+            .accessibilityHidden(true)
+    }
+
+    private func noteTranscriptEnd(_ end: CGFloat) {
+        scrollReading.endGap = end - viewportBottom
+        let reading = end - viewportBottom > Self.jumpToLatestThreshold
+        if reading != showsJumpToLatest {
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { showsJumpToLatest = reading }
+        }
+    }
+
+    /// The reader started scrolling (`true`), or the scroll came to rest.
+    /// Starting detaches the transcript from the end, so a reply streaming
+    /// in cannot pull the page out from under their finger; coming to rest
+    /// at the end attaches it again.
+    private func readerScroll(_ scrolling: Bool) {
+        if scrolling {
+            readerScrolled = true
+            if !readerDetached { readerDetached = true }
+        } else if readerDetached, scrollReading.endGap <= Self.followSlack {
+            readerDetached = false
+        }
+    }
+
+    /// One face, in one layer, measured from the screen's top
+    /// edge: it sits in the island while that is open and
+    /// glides into its header slot when the island lets go.
+    private var floatingFace: some View {
+        let topInset = IslandGeometry.topInset
+        let islandSide: CGFloat = 220
+        // centred in the part of the square the hardware island does not cover
+        let islandFaceCentre = IslandGeometry.top + IslandGeometry.size.height + (islandSide - IslandGeometry.size.height) / 2
+        let headerFaceCentre = topInset + 26
+        let faceSize = 60 + 72 * facePhase
+        let faceCentre = headerFaceCentre + (islandFaceCentre - headerFaceCentre) * facePhase
+        return ZStack(alignment: .top) {
+            if islandVisible {
+                IslandShell(expanded: islandExpanded, expandedSize: CGSize(width: islandSide, height: islandSide)) {
+                    Color.clear
+                }
+            }
+            ChatAvatarView(chat: current, size: faceSize, state: MausState.forChat(current, in: session.state), animated: MausState.forChat(current, in: session.state).showsActivity || islandExpanded, comets: islandExpanded)
+                .offset(y: faceCentre - faceSize / 2)
+                .allowsHitTesting(false)
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder private func jumpToLatestPill(_ proxy: ScrollViewProxy) -> some View {
+        if showsJumpToLatest {
+            Button {
+                readerDetached = false
+                withAnimation { proxy.scrollTo(Self.transcriptEndId, anchor: .bottom) }
+            } label: {
+                Label("Jump to latest", systemImage: "arrow.down")
+                    .font(.footnote.weight(.medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08)))
+                    .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Jump to latest messages")
+            .padding(.bottom, 10)
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+        }
+    }
+
+    /// grow, hold a beat, shrink — the face rides along
+    private func playIslandIntro() async {
+        guard CompanionLayout.supportsIslandPresentation, !reduceMotion else { return }
+        // The intro is a greeting, and a greeting repeated every
+        // time you open a chat stops being one.
+        let intro = IslandIntro(rawValue: islandIntro) ?? .oncePerBot
+        switch intro {
+        case .never:
+            return
+        case .oncePerBot:
+            guard !IslandSeen.contains(islandIntroID, in: islandSeen) else { return }
+            islandSeen = IslandSeen.adding(islandIntroID, to: islandSeen)
+        case .always:
+            break
+        }
+        islandVisible = true
+        try? await Task.sleep(for: .milliseconds(40))
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) { islandExpanded = true; facePhase = 1 }
+        try? await Task.sleep(for: .milliseconds(1000))
+        withAnimation(.spring(response: 0.55, dampingFraction: 0.82)) { islandExpanded = false; facePhase = 0 }
+        try? await Task.sleep(for: .milliseconds(600))
+        islandVisible = false
+    }
+
+    /// One more scroll to the end once the first layout has settled, unless
+    /// the reader has already scrolled away.
+    private func settleOnEnd(_ proxy: ScrollViewProxy) async {
+        try? await Task.sleep(for: .milliseconds(50))
+        guard !Task.isCancelled, !readerScrolled, !rows.isEmpty else { return }
+        proxy.scrollTo(Self.transcriptEndId, anchor: .bottom)
+    }
+
+    private func revealFocusedMessage(_ proxy: ScrollViewProxy, in transcript: [TranscriptRow]) {
+        guard let messageId = session.focusedMessageId,
+              messages.contains(where: { $0.id == messageId })
+        else { return }
+        revealedMessageId = messageId
+        // Materialize the lazy folded row first. Its target bubble
+        // scrolls itself into view once expansion has laid it out.
+        let folded = transcript.first { row in
+            if case let .assistantTurn(turn) = row {
+                return turn.messages.contains { $0.id == messageId }
+            }
+            return false
+        }
+        proxy.scrollTo(folded?.id ?? messageId, anchor: .center)
+        session.consumeFocus(messageId)
+    }
+
+    // MARK: - Thread lifecycle
+
+    /// Opening a chat: remember it, load it, and mark it read.
+    private func enterThread() async {
+        if selectedThreadWasRemoved { dismiss(); return }
+        let openedChat = current
+        session.threadSelection.rememberThread(openedChat, connectionID: session.connection?.id)
+        await session.loadThreadIfNeeded(openedChat.threadId)
+        // opening a chat is what marks it read, exactly as on the desktop
+        if openedChat.unread { await session.markRead(openedChat) }
+#if DEBUG
+        // `-open-plus`: the + sheet up, for the screenshot harness
+        if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
+        // Profile parity screenshots without automating a tap through the
+        // animated island/header transition.
+        if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
+        // `-chat-typing-preview`: the turn starts a beat after the chat
+        // opens, so the typing bubble arrives with no new message to follow.
+        if ProcessInfo.processInfo.arguments.contains("-chat-typing-preview"), !openedChat.busy {
+            try? await Task.sleep(for: .milliseconds(1500))
+            if !Task.isCancelled { session.setPreviewTurn(busy: true, threadId: openedChat.threadId) }
+        }
+#endif
+    }
+
+    private func reloadIfPageDropped(_ loaded: Bool) {
+        let requestedThread = threadId
+        if !loaded { Task { await session.loadThreadIfNeeded(requestedThread) } }
+    }
+
+    /// A message can arrive while this chat is already on screen. The
+    /// opening task will not run again, so clear that new unread bit here
+    /// rather than leaving a badge on an open conversation.
+    private func markReadIfNeeded(_ unread: Bool) {
+        let readChat = current
+        if unread { Task { await session.markRead(readChat) } }
+    }
+
+    /// The local task picker changed threads: park this one's draft, bring
+    /// back the next one's, and drop what belonged to the old thread.
+    private func switchThread(from previous: String, to next: String) {
+        dictation.stop()
+        threadDrafts[previous] = ComposerSnapshot(text: draft, attachments: attachments, error: attachmentError)
+        let restored = threadDrafts.removeValue(forKey: next) ?? ComposerSnapshot()
+        draft = restored.text
+        attachments = restored.attachments
+        attachmentError = restored.error
+        selectedPhotos = []
+        showCommandHUD = false
+        showingPlus = false
+        readerScrolled = false
+        // The next thread opens on its newest message; the pill comes back
+        // once its own end is measured below the screen.
+        readerDetached = false
+        showsJumpToLatest = false
+        // A download started in the previous task must not open a sheet (or
+        // surface its error) in the new one when the network reply arrives late.
+        resetFilePreview()
+        cancelThreadOpen()
+    }
+
+    private func expireSteering() async {
+        guard steering else { return }
+        try? await Task.sleep(for: .seconds(20))
+        if !Task.isCancelled { steering = false }
+    }
+
+    private func stopDictation(ifInterruptedBy note: Notification) {
+        let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey]
+        let value = (raw as? NSNumber)?.uintValue ?? (raw as? UInt)
+        if value == AVAudioSession.InterruptionType.began.rawValue {
+            dictation.stop()
+        }
+    }
+
+    @ViewBuilder private var busyFleetFixtureBadge: some View {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-busy-fleet-preview") {
+            VStack(alignment: .trailing, spacing: 0) {
+                Text("Offline busy-fleet fixture")
+                    .font(.caption2)
+                    .accessibilityIdentifier("busy-fleet-progress")
+                    .accessibilityValue(session.state.cursor ?? "0")
+                // Message rows drawn so far: ResponsivenessUITests checks
+                // that typing and other threads' tokens add none.
+                Text(verbatim: "rows \(TranscriptRedrawProbe.rows)")
+                    .font(.caption2)
+                    .accessibilityIdentifier("transcript-row-redraws")
+                    .accessibilityValue(String(TranscriptRedrawProbe.rows))
+            }
+            .allowsHitTesting(false)
+        }
+#endif
     }
 
     // MARK: - Live call
@@ -696,6 +997,9 @@ struct ChatView: View {
                     }
                     .buttonStyle(.plain)
                     .glassCapsule()
+                    // The thread you are on, now that the pill under the
+                    // face that named it is gone.
+                    .accessibilityValue(Text(verbatim: current.threadTitle))
                     .accessibilityIdentifier("header-threads")
                 }
                 if case .bot = current {
@@ -729,16 +1033,16 @@ struct ChatView: View {
         )
     }
 
-    /// The bot's face over its name pill, floating over the transcript
-    /// between the two buttons.
+    /// The seat for the bot's face, floating over the transcript between the
+    /// two buttons. The thread it is on is the Threads button's to say.
     private var headerFace: some View {
-        VStack(spacing: 6) {
-            // Always here, following the island's face while that one is
-            // the source: when the island lets go, this one flies home.
-            // The face itself is drawn by the island layer above so there is
-            // still only one animated avatar. This transparent seat becomes
-            // its independent profile button once the opening transition has
-            // settled.
+        // Always here, following the island's face while that one is
+        // the source: when the island lets go, this one flies home.
+        // The face itself is drawn by the island layer above so there is
+        // still only one animated avatar. This transparent seat becomes
+        // its independent profile button once the opening transition has
+        // settled.
+        Group {
             if case .bot = current {
                 Button { showingProfile = true } label: {
                     Color.clear
@@ -750,38 +1054,15 @@ struct ChatView: View {
                 .accessibilityHidden(islandVisible)
                 .accessibilityLabel("Open \(current.name) settings")
                 .accessibilityHint("Changes this bot's model, profile, notifications, and voice")
-            } else {
-                Color.clear.frame(width: 60, height: 60)
+            } else if case let .room(room) = current {
+                // A room's face says whose room this is: the header has no
+                // other place for its name and members.
+                Color.clear
+                    .frame(width: 60, height: 60)
+                    .accessibilityElement()
+                    .accessibilityLabel("\(room.name), \(room.memberIds.count) bots")
+                    .accessibilityIdentifier("header-room")
             }
-            Button {
-                if current.supportsTasks { showingTasks = true }
-                else { showingPlus = true }
-            } label: {
-                HStack(spacing: 6) {
-                    Text(current.name)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(Color.primary)
-                        .lineLimit(1)
-                    if current.supportsTasks || !current.subtitle.isEmpty {
-                        Text(current.supportsTasks ? current.threadTitle : current.subtitle)
-                            .font(.system(size: 13))
-                            .foregroundStyle(Color.secondary)
-                            .lineLimit(1)
-                    }
-                    Image(systemName: current.supportsTasks ? "chevron.down" : "ellipsis")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Color.secondary)
-                }
-                .padding(.leading, 12)
-                .padding(.trailing, 10)
-                .frame(height: 32)
-                .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .glassCapsule()
-            .accessibilityLabel(current.supportsTasks ? "Switch thread: \(current.threadTitle)" : "Open \(current.name) thread options")
-            .accessibilityHint("Choose a conversation or start a new thread")
-            .accessibilityIdentifier("thread-switcher")
         }
         .padding(.top, -4)
     }
@@ -946,8 +1227,8 @@ struct ChatView: View {
         return next.kind != .text
     }
 
-    private var canSend: Bool {
-        (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+    private func canSend(_ typed: String) -> Bool {
+        (!typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
             && !preparingAttachments && !sendingMessage
     }
 
@@ -963,20 +1244,34 @@ struct ChatView: View {
         messages.contains { $0.card?.isPending == true }
     }
 
+    /// Who the @ being typed can tag, filtered by what follows it. Empty
+    /// while no tag is being typed, which is what keeps the picker closed.
+    private func mentionChoices(_ typed: String) -> [MentionChoice] {
+        ComposerMention.choices(for: typed, pool: ComposerMention.pool(for: current, bots: session.state.bots))
+    }
+
     private var engineCanSteer: Bool {
         guard case let .bot(bot) = current else { return false }
         return attachments.isEmpty && session.steeringInstanceIds.contains(bot.modelSelection.instanceId)
     }
 
+    /// The one open question a typed line answers. A bot blocked on its
+    /// question never reads a line steered into its turn, so while exactly
+    /// one question waits (and nothing is attached) Send answers it instead.
+    private var composerQuestion: ComposerQuestion.Target? {
+        ComposerQuestion.target(in: messages, chatName: current.name, hasAttachments: !attachments.isEmpty)
+    }
+
     private var composerPrompt: String {
         if sendingMessage { return "Sending…" }
         if dictation.isListening { return "Listening…" }
+        if let asker = composerQuestion?.asker { return String(localized: "Answer \(asker)…") }
         if current.busy { return engineCanSteer ? "Sends into this turn" : "Sends after this turn" }
         return "Ask \(current.name)"
     }
 
-    private var steerQueued: (() -> Void)? {
-        guard current.busy, !hasPendingApproval, case let .bot(bot) = current else { return nil }
+    private func steerQueued(pendingApproval: Bool) -> (() -> Void)? {
+        guard current.busy, !pendingApproval, case let .bot(bot) = current else { return nil }
         return {
             steering = true
             dictation.stop()
@@ -993,6 +1288,8 @@ struct ChatView: View {
         let text = (explicitText ?? draftAtSend).trimmingCharacters(in: .whitespacesAndNewlines)
         let outgoingAttachments = attachments
         let chatAtSend = current
+        // Only the typed line answers; a chip or a command is its own ask.
+        let question = explicitText == nil ? composerQuestion : nil
         guard !text.isEmpty || !outgoingAttachments.isEmpty,
               !preparingAttachments,
               !sendingMessage
@@ -1001,12 +1298,32 @@ struct ChatView: View {
         attachmentError = nil
         showCommandHUD = false
         showingPlus = false
+        // Sending is the one time the transcript goes to its end even when
+        // the reader had scrolled back: the message lands there.
+        readerDetached = false
+        sendJumps &+= 1
         Task {
-            let sent = await session.send(
-                text: text,
-                attachments: outgoingAttachments,
-                to: chatAtSend
-            )
+            let sent: Bool
+            if let question, !text.isEmpty {
+                switch await session.answer(chat: chatAtSend, card: question.card, inWords: question.answer(text)) {
+                case .answered:
+                    sent = true
+                case .gone:
+                    // The question closed before the line reached it: say
+                    // it as an ordinary message rather than lose it.
+                    sent = await session.send(text: text, attachments: [], to: chatAtSend)
+                case let .failed(failure):
+                    // Keep the words in the field, with the reason under it.
+                    session.actionError = failure
+                    sent = false
+                }
+            } else {
+                sent = await session.send(
+                    text: text,
+                    attachments: outgoingAttachments,
+                    to: chatAtSend
+                )
+            }
             sendingMessage = false
             guard sent else {
                 let failure = session.actionError ?? "Couldn't send this message. Try again."
@@ -1206,21 +1523,9 @@ struct ChatView: View {
         threadOpenTask = nil
     }
 
-    private func openLink(_ url: URL, from message: Message) -> OpenURLAction.Result {
-        guard let target = LocalMessageLink.resolve(url) else {
-            fileOpenError = "This link can't be opened securely."
-            return .handled
-        }
-        switch target {
-        case let .web(webURL):
-            return .systemAction(webURL)
-        case let .desktopFile(path):
-            openFile(path: path, from: message)
-            return .handled
-        }
-    }
-
-    private func openFile(path: String, from message: Message) {
+    /// A link in a message to a file on the computer: download it into a
+    /// preview. (Which links are files is `TranscriptActions.openLink`.)
+    private func openFile(path: String, messageId: String) {
         fileDownloadTask?.cancel()
         let requestID = UUID()
         fileDownloadRequestID = requestID
@@ -1231,7 +1536,7 @@ struct ChatView: View {
         let task = Task {
             let downloaded = await session.downloadFile(
                 threadId: requestedThreadID,
-                messageId: message.id,
+                messageId: messageId,
                 path: path
             )
             if let downloaded, let preview = FilePreviewItem(downloaded: downloaded) {
@@ -1296,254 +1601,50 @@ struct ChatView: View {
     }
 
     /// A round + and a glass pill with dictation and send inside it.
-    private var composer: some View {
-        VStack(spacing: 6) {
+    ///
+    /// Drawn inside `DraftReader`, the one view that observes the draft: a
+    /// keystroke redraws the composer, not this screen and its transcript.
+    private func composer(_ snapshot: TranscriptSnapshot) -> some View {
+        DraftReader(draft: composerDraft) { text in
+            composerStack(text, snapshot: snapshot)
+        }
+    }
+
+    private func composerStack(_ text: Binding<String>, snapshot: TranscriptSnapshot) -> some View {
+        let typed = text.wrappedValue
+        return VStack(spacing: 6) {
+            let mentions = composerFocused && !showCommandHUD && !dictation.isListening ? mentionChoices(typed) : []
+            if !mentions.isEmpty {
+                MentionPicker(choices: mentions, bots: session.state.bots) { choice in
+                    Haptics.selection()
+                    if let completed = ComposerMention.complete(draft, with: choice) { draft = completed }
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            if let line = liveStatusLine(snapshot)?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
+                LiveStatusLine(text: line, step: snapshot.live.latest)
+                    .transition(.opacity)
+            }
             if !heldSends.isEmpty {
-                QueuedSendList(sends: heldSends, steer: steerQueued, steering: steering, edit: editQueued) { send in
+                QueuedSendList(
+                    sends: heldSends, steer: steerQueued(pendingApproval: snapshot.hasPendingApproval),
+                    steering: steering, edit: editQueued
+                ) { send in
                     Task { await session.cancelQueued(send, threadId: threadId, in: current) }
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            if preparingAttachments || sendingMessage {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(preparingAttachments ? "Preparing attachments…" : "Sending…")
-                        .font(.system(size: 13, weight: .medium))
-                }
-                .foregroundStyle(Color.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 4)
-                .accessibilityElement(children: .combine)
-            }
+            composerNotices
 
-            if let openingFileName {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Opening \(openingFileName)…")
-                        .font(.system(size: 13, weight: .medium))
-                        .lineLimit(1)
-                }
-                .foregroundStyle(Color.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 4)
-                .accessibilityElement(children: .combine)
-            }
-
-            if let error = fileOpenError ?? attachmentError {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(Color.orange)
-                    Text(error)
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 4)
-                    Button("Dismiss") {
-                        fileOpenError = nil
-                        attachmentError = nil
-                    }
-                    .font(.system(size: 13, weight: .semibold))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-                .accessibilityElement(children: .combine)
-            }
-
-            if let error = dictation.error {
-                Text(error)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 4)
-            }
-
-            if showCommandHUD {
-                CommandSkillHUDView(
-                    text: $draft,
-                    isVisible: $showCommandHUD,
-                    commands: current.isBot
-                        ? CommandSkillHUDView.defaultCommands
-                        : CommandSkillHUDView.defaultCommands.filter {
-                            $0.id != "computer" && (current.supportsTasks || $0.id != "tasks")
-                        },
-                    accentColor: MausPalette.color(current.color)
-                ) { command in
-                    switch command.id {
-                    case "computer":
-                        draft = ""
-                        showingComputer = true
-                    case "tasks":
-                        draft = ""
-                        showingTasks = true
-                    default: submit(command.command)
-                    }
-                }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if draft.isEmpty && attachments.isEmpty && !current.busy
-                        && !hasPendingApproval && !storedChips.isEmpty {
-                PredictiveActionChipsView(chips: storedChips, accentColor: MausPalette.color(current.color)) { chip in
-                    submit(chip.prompt)
-                }
-                .transition(.opacity)
-            }
+            composerSuggestions(text, pendingApproval: snapshot.hasPendingApproval)
 
             if !attachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(attachments) { attachment in
-                            PendingAttachmentChip(attachment: attachment) {
-                                guard !preparingAttachments, !sendingMessage else { return }
-                                attachments.removeAll { $0.id == attachment.id }
-                                attachmentError = nil
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 2)
-                }
-                .scrollClipDisabledCompat()
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                attachmentStrip
             }
 
-            GlassGroup(spacing: 10) {
-                HStack(alignment: .bottom, spacing: 10) {
-                    Button {
-                        dictation.stop()
-                        composerFocused = false
-                        withAnimation(.snappy(duration: 0.28)) { showingPlus.toggle() }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 20, weight: .medium))
-                            .foregroundStyle(showingPlus ? Color(uiColor: .systemBackground) : Color.primary)
-                            .rotationEffect(.degrees(showingPlus ? 45 : 0))
-                            .frame(width: 44, height: 44)
-                            .background(Circle().fill(showingPlus ? Color.primary : Color.clear))
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .glassCapsule()
-                    .disabled(preparingAttachments || sendingMessage)
-                    .accessibilityLabel(showingPlus ? "Close" : "More")
-
-                    HStack(alignment: .bottom, spacing: 6) {
-                        Button {
-                            dictation.stop()
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                                showCommandHUD.toggle()
-                            }
-                            Haptics.selection()
-                        } label: {
-                            Image(systemName: "command")
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundStyle(showCommandHUD ? Color.primary : Color.secondary)
-                                .frame(width: 30, height: 32)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(preparingAttachments || sendingMessage)
-                        .accessibilityLabel("Slash commands")
-                        .padding(.leading, 6)
-                        .padding(.bottom, 6)
-
-                        TextField(
-                            composerPrompt,
-                            text: $draft,
-                            axis: .vertical
-                        )
-                            .lineLimit(1...5)
-                            .font(.system(size: 17))
-                            .padding(.vertical, 11)
-                            .focused($composerFocused)
-                            .accessibilityIdentifier("message-input")
-                            // Partial transcripts rebuild from a frozen base;
-                            // prevent competing edits without dimming the text.
-                            .allowsHitTesting(
-                                !dictation.isListening && !dictation.isStarting
-                                    && !preparingAttachments && !sendingMessage
-                            )
-                            .onValueChange(of: draft) { value in
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    showCommandHUD = value.hasPrefix("/")
-                                }
-                            }
-                            // The software keyboard's Return inserts a newline,
-                            // like Messages; only the arrow button sends. A
-                            // hardware Return still sends, Shift-Return breaks
-                            // the line. onKeyPress never sees the software
-                            // keyboard, so this cannot turn its Return into a send.
-                            .onHardwareReturn { submit() }
-
-                        // Stop sits in the bar while the turn runs, as it does
-                        // on the desktop. The Interrupt action under + was the
-                        // only way before, and rooms had none at all.
-                        if current.canStop {
-                            Button {
-                                Haptics.selection()
-                                Task { await session.interrupt(current) }
-                            } label: {
-                                Image(systemName: "stop.fill")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .foregroundStyle(Color.primary)
-                                    .frame(width: 32, height: 32)
-                                    .background(Circle().fill(Color.secondary.opacity(0.12)))
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.bottom, 6)
-                            .accessibilityLabel("Stop the current turn")
-                            .accessibilityIdentifier("composer-stop")
-                            .transition(.scale.combined(with: .opacity))
-                        }
-
-                        Button {
-                            composerFocused = false
-                            dictation.toggle(capturing: draft)
-                        } label: {
-                            Image(systemName: dictation.isListening ? "mic.fill" : "mic")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(dictation.isListening ? Color.red : Color.primary)
-                                .frame(width: 32, height: 32)
-                                .background(
-                                    Circle().fill(
-                                        dictation.isListening
-                                            ? Color.red.opacity(0.2)
-                                            : Color.secondary.opacity(0.12)
-                                    )
-                                )
-                                .pulseCompat(isActive: dictation.isListening)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(preparingAttachments || sendingMessage || liveCall.machine.isActive)
-                        .padding(.bottom, 6)
-                        .accessibilityLabel(dictation.isListening ? "Stop dictation" : "Start dictation")
-
-                        Button { submit() } label: {
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundStyle(canSend ? Color.white : Color.secondary)
-                                .frame(width: 32, height: 32)
-                                .background(
-                                    Circle().fill(canSend ? BubbleColor.mine : Color.secondary.opacity(0.18))
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!canSend)
-                        .padding(.trailing, 6)
-                        .padding(.bottom, 6)
-                        .animation(.easeOut(duration: 0.15), value: canSend)
-                        .accessibilityLabel(current.busy
-                            ? engineCanSteer ? "Send into the running turn" : "Queue this message for when the turn finishes"
-                            : "Send message")
-                    }
-                    .frame(minHeight: 44)
-                    // A capsule at one line (44pt tall, 22pt corners) that
-                    // keeps those 22pt corners as the draft grows, the way
-                    // Messages does. A true Capsule would round to half the
-                    // height, and a five-line draft became a giant pill.
-                    .glassSheet(cornerRadius: 22)
-                }
-            }
+            composerBar(text)
         }
         .padding(.horizontal, 12)
         .padding(.top, 6)
@@ -1551,18 +1652,405 @@ struct ChatView: View {
         .frame(maxWidth: CompanionLayout.chatWidth)
         .frame(maxWidth: .infinity)
     }
+
+    /// Progress and errors above the field: preparing or sending, a file
+    /// opening, a failed send or attachment, a dictation failure.
+    @ViewBuilder private var composerNotices: some View {
+        if preparingAttachments || sendingMessage {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(preparingAttachments ? "Preparing attachments…" : "Sending…")
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .foregroundStyle(Color.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+            .accessibilityElement(children: .combine)
+        }
+
+        if let openingFileName {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Opening \(openingFileName)…")
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Color.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+            .accessibilityElement(children: .combine)
+        }
+
+        if let error = fileOpenError ?? attachmentError {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(Color.orange)
+                Text(error)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Button("Dismiss") {
+                    fileOpenError = nil
+                    attachmentError = nil
+                }
+                .font(.system(size: 13, weight: .semibold))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+            .accessibilityElement(children: .combine)
+        }
+
+        if let error = dictation.error {
+            Text(error)
+                .font(.system(size: 13))
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 4)
+        }
+    }
+
+    /// The slash-command HUD while one is being typed, else the Settings
+    /// chips while there is nothing to say yet.
+    @ViewBuilder
+    private func composerSuggestions(_ text: Binding<String>, pendingApproval: Bool) -> some View {
+        if showCommandHUD {
+            CommandSkillHUDView(
+                text: text,
+                isVisible: $showCommandHUD,
+                commands: current.isBot
+                    ? CommandSkillHUDView.defaultCommands
+                    : CommandSkillHUDView.defaultCommands.filter {
+                        $0.id != "computer" && (current.supportsTasks || $0.id != "tasks")
+                    },
+                accentColor: MausPalette.color(current.color)
+            ) { command in
+                switch command.id {
+                case "computer":
+                    draft = ""
+                    showingComputer = true
+                case "tasks":
+                    draft = ""
+                    showingTasks = true
+                default: submit(command.command)
+                }
+            }
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        } else if text.wrappedValue.isEmpty && attachments.isEmpty && !current.busy
+                    && !pendingApproval && !storedChips.isEmpty {
+            PredictiveActionChipsView(chips: storedChips, accentColor: MausPalette.color(current.color)) { chip in
+                submit(chip.prompt)
+            }
+            .transition(.opacity)
+        }
+    }
+
+    private var attachmentStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { attachment in
+                    PendingAttachmentChip(attachment: attachment) {
+                        guard !preparingAttachments, !sendingMessage else { return }
+                        attachments.removeAll { $0.id == attachment.id }
+                        attachmentError = nil
+                    }
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+        .scrollClipDisabledCompat()
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    private func composerBar(_ text: Binding<String>) -> some View {
+        GlassGroup(spacing: 10) {
+            HStack(alignment: .bottom, spacing: 10) {
+                plusButton
+
+                HStack(alignment: .bottom, spacing: 6) {
+                    commandButton
+                    composerField(text)
+
+                    // Stop sits in the bar while the turn runs, as it does
+                    // on the desktop. The Interrupt action under + was the
+                    // only way before, and rooms had none at all.
+                    if current.canStop {
+                        stopButton
+                    }
+
+                    dictationButton
+                    sendButton(canSend: canSend(text.wrappedValue))
+                }
+                .frame(minHeight: 44)
+                // A capsule at one line (44pt tall, 22pt corners) that
+                // keeps those 22pt corners as the draft grows, the way
+                // Messages does. A true Capsule would round to half the
+                // height, and a five-line draft became a giant pill.
+                .glassSheet(cornerRadius: 22)
+            }
+        }
+    }
+
+    private var plusButton: some View {
+        Button {
+            dictation.stop()
+            composerFocused = false
+            withAnimation(.snappy(duration: 0.28)) { showingPlus.toggle() }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(showingPlus ? Color(uiColor: .systemBackground) : Color.primary)
+                .rotationEffect(.degrees(showingPlus ? 45 : 0))
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(showingPlus ? Color.primary : Color.clear))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassCapsule()
+        .disabled(preparingAttachments || sendingMessage)
+        .accessibilityLabel(showingPlus ? "Close" : "More")
+    }
+
+    private var commandButton: some View {
+        Button {
+            dictation.stop()
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                showCommandHUD.toggle()
+            }
+            Haptics.selection()
+        } label: {
+            Image(systemName: "command")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(showCommandHUD ? Color.primary : Color.secondary)
+                .frame(width: 30, height: 32)
+        }
+        .buttonStyle(.plain)
+        .disabled(preparingAttachments || sendingMessage)
+        .accessibilityLabel("Slash commands")
+        .padding(.leading, 6)
+        .padding(.bottom, 6)
+    }
+
+    private func composerField(_ text: Binding<String>) -> some View {
+        TextField(
+            composerPrompt,
+            text: text,
+            axis: .vertical
+        )
+            .lineLimit(1...5)
+            .font(.system(size: 17))
+            .padding(.vertical, 11)
+            .focused($composerFocused)
+            .accessibilityIdentifier("message-input")
+            // Partial transcripts rebuild from a frozen base;
+            // prevent competing edits without dimming the text.
+            .allowsHitTesting(
+                !dictation.isListening && !dictation.isStarting
+                    && !preparingAttachments && !sendingMessage
+            )
+            .onValueChange(of: text.wrappedValue) { value in
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    showCommandHUD = value.hasPrefix("/")
+                }
+            }
+            // The software keyboard's Return inserts a newline,
+            // like Messages; only the arrow button sends. A
+            // hardware Return still sends, Shift-Return breaks
+            // the line. onKeyPress never sees the software
+            // keyboard, so this cannot turn its Return into a send.
+            .onHardwareReturn { submit() }
+    }
+
+    private var stopButton: some View {
+        Button {
+            Haptics.selection()
+            Task { await session.interrupt(current) }
+        } label: {
+            Image(systemName: "stop.fill")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(Color.primary)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(Color.secondary.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+        .padding(.bottom, 6)
+        .accessibilityLabel("Stop the current turn")
+        .accessibilityIdentifier("composer-stop")
+        .transition(.scale.combined(with: .opacity))
+    }
+
+    private var dictationButton: some View {
+        let listening = dictation.isListening
+        let fill: Color = listening ? Color.red.opacity(0.2) : Color.secondary.opacity(0.12)
+        return Button {
+            composerFocused = false
+            dictation.toggle(capturing: draft)
+        } label: {
+            Image(systemName: listening ? "mic.fill" : "mic")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(listening ? Color.red : Color.primary)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(fill))
+                .pulseCompat(isActive: listening)
+        }
+        .buttonStyle(.plain)
+        .disabled(preparingAttachments || sendingMessage || liveCall.machine.isActive)
+        .padding(.bottom, 6)
+        .accessibilityLabel(listening ? "Stop dictation" : "Start dictation")
+    }
+
+    private func sendButton(canSend: Bool) -> some View {
+        let fill: Color = canSend ? BubbleColor.mine : Color.secondary.opacity(0.18)
+        return Button { submit() } label: {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(canSend ? Color.white : Color.secondary)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(fill))
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSend)
+        .padding(.trailing, 6)
+        .padding(.bottom, 6)
+        .animation(.easeOut(duration: 0.15), value: canSend)
+        .accessibilityLabel(composerQuestion != nil
+            ? "Submit answer"
+            : current.busy
+            ? engineCanSteer ? "Send into the running turn" : "Queue this message for when the turn finishes"
+            : "Send message")
+    }
 }
 
-struct MessageRow: View {
-    let chat: Chat
+/// The composer's text, by reference. ChatView keeps it in `@State`, which
+/// holds an object without observing it, so ChatView's actions can read and
+/// set the draft while only `DraftReader` redraws when it changes.
+@MainActor
+final class ComposerDraft: ObservableObject {
+    @Published var text = ""
+}
+
+/// Draws `content` from the composer's draft, and is the only view that
+/// redraws on a keystroke. Before, the draft was ChatView's own state, so
+/// every keystroke re-ran ChatView's body: the branch walk, the folded rows
+/// and a fresh row for every message in the transcript.
+private struct DraftReader<Content: View>: View {
+    @ObservedObject var draft: ComposerDraft
+    let content: (Binding<String>) -> Content
+
+    init(draft: ComposerDraft, @ViewBuilder content: @escaping (Binding<String>) -> Content) {
+        self.draft = draft
+        self.content = content
+    }
+
+    var body: some View { content($draft.text) }
+}
+
+/// The Settings chip row, decoded once per edit of the setting rather than
+/// twice on every render of the composer.
+@MainActor
+private enum StoredChips {
+    private static var memo: (raw: String, chips: [ActionChipItem])?
+
+    static func chips(_ raw: String) -> [ActionChipItem] {
+        if let memo, memo.raw == raw { return memo.chips }
+        let chips = QuickReply.decode(raw).map {
+            ActionChipItem(id: $0.id, title: $0.title, icon: $0.icon, prompt: $0.prompt)
+        }
+        memo = (raw, chips)
+        return chips
+    }
+}
+
+/// Where the transcript's end sits against the bottom of the screen, as of
+/// the last scrolled frame. A reference held in `@State`: it changes on
+/// every frame of a scroll, and nothing needs to redraw when it does.
+private final class ScrollReading {
+    var endGap: CGFloat = 0
+}
+
+/// Keeps the newest message in view while the reader is at the end, and
+/// leaves them where they are once they have scrolled back to read.
+///
+/// Before, every new row (animated) and every batch of a streaming reply
+/// scrolled to the bottom unconditionally, so a reader scrolled up to
+/// re-read something was pulled back down twenty times a second.
+private struct FollowsLatest: ViewModifier {
+    let proxy: ScrollViewProxy
+    let lastRowId: String?
+    let streamLength: Int
+    /// The reader was at the end as of the last layout, so before this
+    /// update's rows were laid out.
+    let follows: Bool
+    /// The typing bubble is showing (`ChatView.showsTyping`).
+    let typing: Bool
+    let sendJumps: Int
+    let reduceMotion: Bool
+    /// The opening scroll has happened. Per thread: the transcript's scroll
+    /// view, and so this, is rebuilt when the thread changes.
+    @State private var landed = false
+
+    func body(content: Content) -> some View {
+        content
+            // `initial: true` is what opens the chat on the newest
+            // message where `scrollAnchorCompat` cannot (iOS 16). On 17 the
+            // anchor has already put us there and this is a no-op. After
+            // that, a new row is followed only from the end.
+            // The end, not the last message: the typing bubble sits under
+            // the message that started it, and landing on the message left
+            // the bubble below the composer, where nobody saw it.
+            .onValueChange(of: lastRowId, initial: true) { last in
+                guard last != nil, follows || !landed else { return }
+                landed = true
+                withAnimation { proxy.scrollTo(ChatView.transcriptEndId, anchor: .bottom) }
+            }
+            // The bubble also comes and goes with no new message to follow:
+            // the turn is accepted a frame after your message lands, a tool
+            // step starts after a reply. Bring it into view then, unless you
+            // are up in the scrollback reading.
+            .onValueChange(of: typing) { shown in
+                guard shown, follows else { return }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                    proxy.scrollTo(ChatView.transcriptEndId, anchor: .bottom)
+                }
+            }
+            // Follow the text as it arrives. Keyed on length rather than
+            // the string so this fires once per delta batch, and without
+            // animation — animating every token turns a smooth stream
+            // into a stutter, because each scroll interrupts the last.
+            .onValueChange(of: streamLength) { length in
+                guard length > 0, follows else { return }
+                proxy.scrollTo(ChatView.liveBubbleId, anchor: .bottom)
+            }
+            .onValueChange(of: sendJumps) { _ in
+                proxy.scrollTo(ChatView.transcriptEndId, anchor: .bottom)
+            }
+    }
+}
+
+/// One message: its bubble or card, and what hangs off it (call label,
+/// reactions, version switcher, the long-press menu).
+///
+/// Drawn from plain values and compared by them. It reads nothing from the
+/// session while drawing (the per-row lookups are done by ChatView, once
+/// per render, and passed in), and it asks for things through `actions`.
+struct MessageRow: View, Equatable {
     let message: Message
     var versions: [Message] = []
     /// Last bubble of a run from the same side: the one that gets the tail.
     var endsRun = true
-    let openLink: (URL, Message) -> OpenURLAction.Result
-    /// Where an "Opened thread" chip goes; nil leaves the chip a receipt.
-    var openThread: ((ThreadRef) -> Void)? = nil
-    @EnvironmentObject private var session: Session
+    /// The stand-in for an edit the computer has not answered yet. It has no
+    /// server identity, so nothing may react to it or edit it again.
+    var isPendingEdit = false
+    /// Where a routine card's Open run goes: the same route an "Opened
+    /// thread" chip takes, so the run lands on screen without joining the
+    /// thread list. Nil (the run was deleted, or the phone holds no bot
+    /// owning it) means no button.
+    var routineRun: ThreadRef? = nil
+    let context: TranscriptRowContext
+    let actions: TranscriptActions
     @State private var editingText = ""
     @State private var showingEdit = false
     /// The text being selected, and the sheet's presentation in one value.
@@ -1572,21 +2060,23 @@ struct MessageRow: View {
 
     private static let reactionChoices = ["👍", "❤️", "😂", "🎉", "👀"]
 
-    /// The stand-in for an edit the computer has not answered yet. It has no
-    /// server identity, so nothing may react to it or edit it again.
-    private var isPendingEdit: Bool {
-        session.state.pendingEdits[chat.threadId]?.placeholderId == message.id
-    }
-
-    /// Transport tags contain paths on the paired computer. They belong in
-    /// attachment cards, never on the clipboard or in the text-selection UI.
-    private var attachedContent: AttachedMessageContent {
-        AttachedMessageContent.parse(message.text ?? "")
+    /// Everything the row draws, its own state aside.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message && lhs.versions == rhs.versions && lhs.endsRun == rhs.endsRun
+            && lhs.isPendingEdit == rhs.isPendingEdit && lhs.routineRun == rhs.routineRun
+            && lhs.context == rhs.context && lhs.actions == rhs.actions
     }
 
     var body: some View {
+#if DEBUG
+        let _ = TranscriptRedrawProbe.noteRow()
+#endif
+        // Transport tags contain paths on the paired computer. They belong
+        // in attachment cards, never on the clipboard or in the
+        // text-selection UI. Parsed once per message: MessagePresentation.
+        let presentation = MessagePresentations.of(message)
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
-            content
+            content(presentation)
 
             if message.isViaCall {
                 // spoken on a Live call and transcribed; the label says why
@@ -1606,85 +2096,22 @@ struct MessageRow: View {
             }
 
             if let reactions = message.reactions, !reactions.isEmpty {
-                HStack(spacing: 6) {
-                    ForEach(reactionGroups(reactions), id: \.emoji) { group in
-                        Button("\(group.emoji) \(group.count)") {
-                            Haptics.selection()
-                            Task { await session.react(to: message, in: chat.threadId, emoji: group.emoji) }
-                        }
-                        .font(.system(size: 13))
-                        .buttonStyle(.bordered)
-                        .buttonBorderShape(.capsule)
-                        .tint(group.mine ? Color.accentColor : Color.secondary)
-                    }
-                }
+                reactionButtons(reactions)
             }
 
-            if versions.count > 1, let index = versions.firstIndex(where: { $0.id == message.id }),
-               case let .bot(bot) = chat {
-                HStack(spacing: 8) {
-                    Button {
-                        Task { await session.switchVersion(to: versions[index - 1], for: bot) }
-                    } label: { Image(systemName: "chevron.left") }
-                    .disabled(index == 0 || bot.busy == true)
-                    Text("\(index + 1) of \(versions.count)")
-                    Button {
-                        Task { await session.switchVersion(to: versions[index + 1], for: bot) }
-                    } label: { Image(systemName: "chevron.right") }
-                    .disabled(index + 1 >= versions.count || bot.busy == true)
-                }
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Color.secondary)
+            if versions.count > 1, let index = versions.firstIndex(where: { $0.id == message.id }), context.isBot {
+                versionSwitcher(at: index)
             }
         }
-        .contextMenu {
-            if !isPendingEdit {
-                ForEach(Self.reactionChoices, id: \.self) { emoji in
-                    Button(emoji) {
-                        Haptics.selection()
-                        Task { await session.react(to: message, in: chat.threadId, emoji: emoji) }
-                    }
-                }
-            }
-            let visibleText = message.webhookContent?.task ?? attachedContent.text
-            if !visibleText.isEmpty {
-                Divider()
-                Button("Copy", systemImage: "doc.on.doc") {
-                    PlatformBridge.copyToPasteboard(visibleText)
-                }
-            }
-            // Copy above takes the whole reply. Selection happens in a sheet
-            // because long-press on the bubble already opens this menu.
-            if !visibleText.isEmpty {
-                Button("Select Text", systemImage: "selection.pin.in.out") {
-                    selecting = SelectableText(text: visibleText)
-                }
-            }
-            // An attachment edit cannot faithfully reconstruct the upload.
-            // Hiding this action is safer than silently dropping the file or
-            // sending its computer-local transport path back as prose.
-            if message.role == .user,
-               message.kind == .text,
-               message.webhookContent == nil,
-               attachedContent.attachments.isEmpty,
-               !isPendingEdit,
-               case let .bot(bot) = chat {
-                Divider()
-                Button("Edit and retry", systemImage: "pencil") {
-                    editingText = message.text ?? ""
-                    showingEdit = true
-                }
-                .disabled(bot.busy == true || session.state.pendingEdits[chat.threadId] != nil)
-            }
-        }
+        .contextMenu { menu(presentation) }
         .alert("Edit and retry", isPresented: $showingEdit) {
             TextField("Message", text: $editingText)
             Button("Cancel", role: .cancel) {}
-            if case let .bot(bot) = chat {
+            if context.isBot {
                 Button("Send") {
                     let text = editingText.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else { return }
-                    Task { await session.edit(message, for: bot, text: text) }
+                    Task { await actions.edit(message, text: text) }
                 }
             }
         } message: {
@@ -1696,44 +2123,114 @@ struct MessageRow: View {
         .accessibilityIdentifier("message-\(message.id)")
     }
 
+    private func reactionButtons(_ reactions: [Reaction]) -> some View {
+        HStack(spacing: 6) {
+            ForEach(reactionGroups(reactions), id: \.emoji) { group in
+                Button("\(group.emoji) \(group.count)") {
+                    Haptics.selection()
+                    Task { await actions.react(to: message, emoji: group.emoji) }
+                }
+                .font(.system(size: 13))
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .tint(group.mine ? Color.accentColor : Color.secondary)
+            }
+        }
+    }
+
+    private func versionSwitcher(at index: Int) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                Task { await actions.switchVersion(to: versions[index - 1]) }
+            } label: { Image(systemName: "chevron.left") }
+            .disabled(index == 0 || context.busy)
+            Text("\(index + 1) of \(versions.count)")
+            Button {
+                Task { await actions.switchVersion(to: versions[index + 1]) }
+            } label: { Image(systemName: "chevron.right") }
+            .disabled(index + 1 >= versions.count || context.busy)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(Color.secondary)
+    }
+
     @ViewBuilder
-    private var content: some View {
+    private func menu(_ presentation: MessagePresentation) -> some View {
+        if !isPendingEdit {
+            ForEach(Self.reactionChoices, id: \.self) { emoji in
+                Button(emoji) {
+                    Haptics.selection()
+                    Task { await actions.react(to: message, emoji: emoji) }
+                }
+            }
+        }
+        let visibleText = presentation.visibleText
+        if !visibleText.isEmpty {
+            Divider()
+            Button("Copy", systemImage: "doc.on.doc") {
+                PlatformBridge.copyToPasteboard(visibleText)
+            }
+        }
+        // Copy above takes the whole reply. Selection happens in a sheet
+        // because long-press on the bubble already opens this menu.
+        if !visibleText.isEmpty {
+            Button("Select Text", systemImage: "selection.pin.in.out") {
+                selecting = SelectableText(text: visibleText)
+            }
+        }
+        // An attachment edit cannot faithfully reconstruct the upload.
+        // Hiding this action is safer than silently dropping the file or
+        // sending its computer-local transport path back as prose.
+        if message.role == .user,
+           message.kind == .text,
+           presentation.webhook == nil,
+           presentation.attached.attachments.isEmpty,
+           !isPendingEdit,
+           context.isBot {
+            Divider()
+            Button("Edit and retry", systemImage: "pencil") {
+                editingText = message.text ?? ""
+                showingEdit = true
+            }
+            .disabled(context.busy || context.editPending)
+        }
+    }
+
+    @ViewBuilder
+    private func content(_ presentation: MessagePresentation) -> some View {
         switch message.kind {
         case .text:
-            TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink)
+            bubble(presentation)
         case .options:
             // A structured ask draws its own card: its answers are the
             // model's questions, not an allow/deny a tap could stand for.
             if message.card?.questions.isEmpty == false {
-                QuestionCardView(chat: chat, message: message)
+                QuestionCardView(message: message, context: context, actions: actions)
             } else {
-                CardView(chat: chat, message: message)
+                CardView(message: message, context: context, actions: actions)
             }
         case .secret:
             if let secret = message.secret {
-                CredentialRequestCardView(chat: chat, message: message, secret: secret)
+                CredentialRequestCardView(message: message, secret: secret, context: context, actions: actions)
             } else if let text = message.text, !text.isEmpty {
-                TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink)
+                bubble(presentation)
             }
         case .activity:
             ActivityChip(
-                tool: message.tool, threadRef: message.threadRef, openThread: openThread,
+                tool: message.tool, threadRef: message.threadRef, openThread: actions.openThread,
                 outputIsProse: message.isTeammateReport
             )
             // A turn that failed because Claude Code is too old for the
             // model: offer to run the updater for the engine this thread uses.
-            if message.tool?.claudeUpdate == true, case let .bot(bot) = chat {
-                ClaudeUpdateCard(
-                    instanceId: bot.currentTaskModelSelection.instanceId,
-                    tint: MausPalette.color(chat.color)
-                )
+            if message.tool?.claudeUpdate == true, let instanceId = context.claudeInstanceId {
+                ClaudeUpdateCard(instanceId: instanceId, tint: MausPalette.color(context.color), actions: actions)
             }
         case .compaction:
             ReceiptChip(icon: "square.3.layers.3d", label: message.compaction?.chipText ?? message.text ?? "") {
                 selecting = SelectableText(text: message.compaction?.summary ?? message.text ?? "")
             }
         case .screen:
-            ScreenShot(threadId: chat.threadId, message: message)
+            ScreenShot(message: message, actions: actions)
         case .digest:
             // Not a bubble: a chip saying the turn did something, opening
             // onto what. `transcriptRows` already dropped the ones with
@@ -1749,13 +2246,13 @@ struct MessageRow: View {
                 RoutineRunCardView(
                     card: card,
                     at: message.date,
-                    tint: MausPalette.color(chat.color),
-                    openRun: routineRunOpener(card)
+                    tint: MausPalette.color(context.color),
+                    openRun: routineRun.map { ref in { actions.openThread(ref) } }
                 )
             } else if let text = message.text, !text.isEmpty {
                 // A computer that sent the kind without its card: the text
                 // is written for exactly this reader.
-                TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink)
+                bubble(presentation)
             }
         case .unknown:
             // A message kind from a newer computer. Almost everything the
@@ -1764,18 +2261,13 @@ struct MessageRow: View {
             // When there is nothing to show, show nothing — a placeholder
             // saying "unsupported" is a worse gap than the gap.
             if let text = message.text, !text.isEmpty {
-                TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink)
+                bubble(presentation)
             }
         }
     }
 
-    /// A run thread is opened by the same route an "Opened thread" chip
-    /// takes, so it lands on screen without joining the thread list. No
-    /// route — the run was deleted, or the phone holds no bot owning it —
-    /// means no button.
-    private func routineRunOpener(_ card: RoutineRunCard) -> (() -> Void)? {
-        guard let openThread, let ref = session.state.routineExecutionRef(for: card) else { return nil }
-        return { openThread(ref) }
+    private func bubble(_ presentation: MessagePresentation) -> TextBubble {
+        TextBubble(message: message, presentation: presentation, context: context, tailed: endsRun, actions: actions)
     }
 
     private func reactionGroups(_ reactions: [Reaction]) -> [(emoji: String, count: Int, mine: Bool)] {
@@ -1808,35 +2300,16 @@ private struct ActivityShareSheet: UIViewControllerRepresentable {
 
 struct TextBubble: View {
     let message: Message
-    let chat: Chat
+    /// What the text shows once its wrappers are off, worked out once per
+    /// message by `MessageRow`.
+    let presentation: MessagePresentation
+    let context: TranscriptRowContext
     var tailed = true
-    let openLink: (URL, Message) -> OpenURLAction.Result
-
-    private var attachedContent: AttachedMessageContent {
-        AttachedMessageContent.parse(message.text ?? "")
-    }
-
-    private var parsedDiff: (filename: String, diff: String)? {
-        guard message.role != .user, let source = message.text else { return nil }
-        let text = source.trimmingCharacters(in: .whitespacesAndNewlines)
-        let diff: String
-        if text.hasPrefix("```diff"), text.hasSuffix("```") {
-            diff = String(text.dropFirst("```diff".count).dropLast(3))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        } else if text.hasPrefix("diff --git ") {
-            diff = text
-        } else {
-            return nil
-        }
-        let firstLine = diff.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
-        let filename = firstLine.split(separator: " ").last.map(String.init)?
-            .replacingOccurrences(of: "b/", with: "") ?? "Git patch"
-        return (filename, diff)
-    }
+    let actions: TranscriptActions
 
     var body: some View {
         let mine = message.role == .user
-        let customCard = parsedDiff != nil
+        let customCard = presentation.patch != nil
         // rooms attribute each line to the member who said it
         let speaker = message.from
         // No face beside the bubble: the bot's face is in the header, and in
@@ -1851,48 +2324,23 @@ struct TextBubble: View {
                         .foregroundStyle(MausPalette.color(speaker.color))
                 }
                 ForEach(message.voiceNotes) { note in
-                    VoiceNoteBubble(note: note, tint: MausPalette.color(chat.color))
+                    VoiceNoteBubble(note: note, tint: MausPalette.color(context.color), actions: actions)
                 }
                 ForEach(message.generatedImages, id: \.path) { attachment in
                     TranscriptAttachmentView(
-                        attachment: attachment, threadId: chat.threadId,
-                        messageId: message.id, foreground: mine ? BubbleColor.mineText : .primary
+                        attachment: attachment, messageId: message.id, actions: actions,
+                        foreground: mine ? BubbleColor.mineText : .primary
                     )
                 }
-                // Bots get markdown, you do not — the same split the desktop
-                // makes. Markdown you did not intend is worse than markdown
-                // you did: a message about `**` should show the asterisks.
-                if let diff = parsedDiff {
-                    GitPRDiffCardView(filename: diff.filename, diffText: diff.diff)
-                } else if let webhook = message.webhookContent {
-                    WebhookMessageBody(content: webhook)
-                } else if mine {
-                    let shared = attachedContent
-                    ForEach(Array(shared.attachments.enumerated()), id: \.offset) { _, attachment in
-                        TranscriptAttachmentView(
-                            attachment: attachment,
-                            threadId: chat.threadId,
-                            messageId: message.id
-                        )
-                    }
-                    if !shared.text.isEmpty {
-                        Text(shared.text)
-                            .font(.system(size: 17))
-                            .foregroundStyle(BubbleColor.mineText)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                } else {
-                    MarkdownText(
-                        source: message.text ?? "",
-                        scrollIdentifier: "message-\(message.id)-scroll"
-                    ) { url in
-                        openLink(url, message)
-                    }
-                        .foregroundStyle(Color.primary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                // Documents, audio and video a bot sent with attach_file. The
+                // card opens the full-screen viewer, which plays video.
+                ForEach(message.attachedFiles, id: \.path) { attachment in
+                    TranscriptAttachmentView(
+                        attachment: attachment, messageId: message.id, actions: actions,
+                        foreground: mine ? BubbleColor.mineText : .primary
+                    )
                 }
+                words(mine: mine)
                 if mine, message.steered == true {
                     Text("sent mid-turn")
                         .font(.system(size: 11))
@@ -1915,6 +2363,40 @@ struct TextBubble: View {
             if !mine { Spacer(minLength: 44) }
         }
     }
+
+    /// Bots get markdown, you do not — the same split the desktop makes.
+    /// Markdown you did not intend is worse than markdown you did: a
+    /// message about `**` should show the asterisks.
+    @ViewBuilder
+    private func words(mine: Bool) -> some View {
+        if let patch = presentation.patch {
+            GitPRDiffCardView(filename: patch.filename, diffText: patch.diff)
+        } else if let webhook = presentation.webhook {
+            WebhookMessageBody(content: webhook)
+        } else if mine {
+            let shared = presentation.attached
+            ForEach(Array(shared.attachments.enumerated()), id: \.offset) { _, attachment in
+                TranscriptAttachmentView(attachment: attachment, messageId: message.id, actions: actions)
+            }
+            if !shared.text.isEmpty {
+                Text(shared.text)
+                    .font(.system(size: 17))
+                    .foregroundStyle(BubbleColor.mineText)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } else {
+            MarkdownText(
+                source: message.text ?? "",
+                scrollIdentifier: "message-\(message.id)-scroll"
+            ) { url in
+                actions.openLink(url, messageId: message.id)
+            }
+                .foregroundStyle(Color.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
 }
 
 /// A tool the bot ran. Deliberately quiet — these are the bulk of a busy
@@ -1933,7 +2415,7 @@ struct ActivityChip: View {
             // carry raw output, and that log stays on the computer's side.
             let output = outputIsProse ? tool.expandableOutput : nil
             let receipt = SkillExecutionReceiptView(
-                skillName: tool.name,
+                skillName: tool.label,
                 status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
                 output: output ?? "",
                 outputIsProse: outputIsProse
@@ -1972,7 +2454,7 @@ struct ActivityChip: View {
                     receipt.allowsHitTesting(false)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(tool.name)
+                .accessibilityLabel(tool.label)
                 .accessibilityHint("Opens the thread")
             } else {
                 receipt
@@ -2020,10 +2502,13 @@ struct ReceiptChip: View {
 /// provider-neutral: Apple Passwords works without another subscription,
 /// while 1Password, Bitwarden and other enabled providers work as usual.
 struct CredentialRequestCardView: View {
-    let chat: Chat
     let message: Message
     let secret: SecretRequestCardData
-    @EnvironmentObject private var session: Session
+    /// The chat, and where this phone stands for secrets (`credentials`):
+    /// values, so the card redraws when they change rather than whenever
+    /// the session publishes.
+    let context: TranscriptRowContext
+    let actions: TranscriptActions
     @Environment(\.scenePhase) private var scenePhase
     @State private var value = ""
     @State private var fieldID = UUID()
@@ -2043,8 +2528,8 @@ struct CredentialRequestCardView: View {
         let requestKey: String?
     }
 
-    private var tint: Color { MausPalette.color(message.from?.color ?? chat.color) }
-    private var requester: String { message.from?.name ?? chat.name }
+    private var tint: Color { MausPalette.color(message.from?.color ?? context.color) }
+    private var requester: String { message.from?.name ?? context.name }
     private var label: String { visible(secret.label) ?? "API credential" }
     private var accessibilityStatus: Text {
         if secret.provided == true {
@@ -2078,14 +2563,13 @@ struct CredentialRequestCardView: View {
     private var hasSecurePairing: Bool {
         guard secret.isPending,
               visible(secret.target) != nil,
-              visible(secret.requestKey) != nil,
-              let connection = session.connection
+              visible(secret.requestKey) != nil
         else { return false }
-        return connection.secretPublicKey != nil && connection.companionDeviceId != nil
+        return context.credentials.pairedForSecrets
     }
 
     private var hasProtectedTransport: Bool {
-        session.phoneCredentialTransportIsProtected
+        context.credentials.transportProtected
     }
 
     private var canEnterOnPhone: Bool { hasSecurePairing && hasProtectedTransport }
@@ -2099,15 +2583,12 @@ struct CredentialRequestCardView: View {
     }
 
     private var requestIdentity: RequestIdentity {
-        let botID: String?
-        switch chat {
-        case let .bot(bot): botID = bot.id
-        case .room: botID = message.from?.botId
-        }
+        // A bot chat's own bot; in a room, the member who asked.
+        let botID = context.isBot ? context.botId : message.from?.botId
         return RequestIdentity(
-            connectionID: session.connection?.id,
+            connectionID: context.credentials.connectionId,
             botID: botID,
-            threadID: chat.threadId,
+            threadID: context.threadId,
             messageID: message.id,
             target: secret.target,
             requestKey: secret.requestKey
@@ -2116,22 +2597,7 @@ struct CredentialRequestCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 11) {
-                Image(systemName: "key.fill")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(tint)
-                    .frame(width: 38, height: 38)
-                    .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(label)
-                        .font(.system(size: 16, weight: .semibold))
-                    Text("Requested by \(requester)")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(Color.secondary)
-                }
-                Spacer(minLength: 0)
-            }
+            heading
 
             if let description = visible(secret.description) {
                 Text(description)
@@ -2140,129 +2606,7 @@ struct CredentialRequestCardView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if secret.provided == true {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(
-                        secret.resumed == true ? "Saved securely. The task resumed." : "Saved securely on your computer.",
-                        systemImage: "checkmark.shield.fill"
-                    )
-                    .foregroundStyle(.green)
-
-                    if secret.resumed != true, let preparedSubmission {
-                        Button(action: { send(preparedSubmission) }) {
-                            HStack(spacing: 7) {
-                                if submitting { ProgressView() }
-                                Image(systemName: "arrow.clockwise")
-                                Text(submitting ? "Resuming…" : "Try resuming the task")
-                            }
-                            .font(.system(size: 13, weight: .semibold))
-                        }
-                        .disabled(submitting || !hasProtectedTransport)
-                    }
-                }
-            } else if secret.dismissed == true {
-                Label("Not provided", systemImage: "xmark.circle")
-                    .foregroundStyle(Color.secondary)
-            } else if submitted {
-                Label("Encrypted and saved on your computer", systemImage: "checkmark.shield.fill")
-                    .foregroundStyle(.green)
-            } else if canEnterOnPhone {
-                VStack(alignment: .leading, spacing: 5) {
-                    Label("Enter securely on this phone", systemImage: "lock.shield.fill")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(tint)
-
-                    if preparedSubmission == nil {
-                        SecureField(placeholder, text: $value)
-                            .id(fieldID)
-                            .textContentType(.password)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .privacySensitive()
-                            .disabled(submitting)
-                            .submitLabel(.done)
-                            .onSubmit { submit() }
-                            .padding(.horizontal, 12)
-                            .frame(minHeight: 44)
-                            .background(
-                                Color.secondary.opacity(0.1),
-                                in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            )
-                            .accessibilityLabel(label)
-                    } else {
-                        Label(
-                            submitting ? "Encrypted and saving…" : "Encrypted and ready to retry",
-                            systemImage: "lock.fill"
-                        )
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.secondary)
-                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .background(
-                            Color.secondary.opacity(0.1),
-                            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        )
-                    }
-
-                    Button(action: submit) {
-                        HStack(spacing: 7) {
-                            if submitting { ProgressView().tint(.white) }
-                            Image(systemName: "lock.fill")
-                            Text(
-                                submitting
-                                    ? "Saving securely…"
-                                    : preparedSubmission == nil ? "Save securely" : "Try again securely"
-                            )
-                        }
-                        .font(.system(size: 14, weight: .semibold))
-                        .frame(maxWidth: .infinity, minHeight: 42)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(tint)
-                    .disabled(!canSubmit)
-
-                    if preparedSubmission != nil, !submitting, submissionError != nil {
-                        Button("Enter a different value") {
-                            discardPreparedSubmission()
-                        }
-                        .font(.system(size: 13, weight: .medium))
-                    }
-
-                    Text("Use Apple Passwords, 1Password, Bitwarden, or paste. The value is encrypted for your computer and never added to chat.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(11)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-            } else if !hasSecurePairing {
-                VStack(alignment: .leading, spacing: 5) {
-                    Label("Pair again to enter here", systemImage: "qrcode")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(tint)
-                    Text("This pairing predates secure phone entry. Scan a fresh QR from OpenMausBot, or finish this request on your computer.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(11)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-            } else {
-                VStack(alignment: .leading, spacing: 5) {
-                    Label("Secure connection required", systemImage: "lock.shield.fill")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(tint)
-                    Text("Switch to Secure phone access (HTTPS) or Tailscale, then try again. You can still finish this request on your computer.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(11)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-            }
+            outcome
 
             if let submissionError = visible(submissionError) {
                 Label(submissionError, systemImage: "exclamationmark.triangle.fill")
@@ -2298,25 +2642,13 @@ struct CredentialRequestCardView: View {
         .accessibilityElement(children: canEnterOnPhone ? .contain : .combine)
         .accessibilityLabel("\(label). \(accessibilityStatus)")
         .onAppear {
-            preparedSubmission = session.preparedCredential(
-                chat: chat,
-                message: message,
-                secret: secret
-            )
+            preparedSubmission = actions.preparedCredential(message: message, secret: secret)
         }
-        .onValueChange(of: requestIdentity) { _ in
-            resetSensitiveState(clearPrepared: true)
-            preparedSubmission = session.preparedCredential(
-                chat: chat,
-                message: message,
-                secret: secret
-            )
-            submitted = false
-        }
-        .onValueChange(of: session.credentialEntryResetGeneration) { _ in
+        .onValueChange(of: requestIdentity) { _ in resetForNewRequest() }
+        .onValueChange(of: context.credentials.resetGeneration) { _ in
             suspendSensitiveEntry()
         }
-        .onValueChange(of: session.status) { status in
+        .onValueChange(of: context.credentials.status) { status in
             if status != .live { suspendSensitiveEntry() }
         }
         .onValueChange(of: scenePhase) { phase in
@@ -2335,6 +2667,189 @@ struct CredentialRequestCardView: View {
         }
     }
 
+    private var heading: some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: "key.fill")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 38, height: 38)
+                .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.system(size: 16, weight: .semibold))
+                Text("Requested by \(requester)")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Color.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// Where the request stands: answered, declined, waiting on this phone,
+    /// or waiting on a connection this phone does not have.
+    @ViewBuilder private var outcome: some View {
+        if secret.provided == true {
+            providedStatus
+        } else if secret.dismissed == true {
+            Label("Not provided", systemImage: "xmark.circle")
+                .foregroundStyle(Color.secondary)
+        } else if submitted {
+            Label("Encrypted and saved on your computer", systemImage: "checkmark.shield.fill")
+                .foregroundStyle(.green)
+        } else if canEnterOnPhone {
+            phoneEntry
+        } else if !hasSecurePairing {
+            pairAgainNotice
+        } else {
+            secureConnectionNotice
+        }
+    }
+
+    private var providedStatus: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(
+                secret.resumed == true ? "Saved securely. The task resumed." : "Saved securely on your computer.",
+                systemImage: "checkmark.shield.fill"
+            )
+            .foregroundStyle(.green)
+
+            if secret.resumed != true, let preparedSubmission {
+                Button(action: { send(preparedSubmission) }) {
+                    HStack(spacing: 7) {
+                        if submitting { ProgressView() }
+                        Image(systemName: "arrow.clockwise")
+                        Text(submitting ? "Resuming…" : "Try resuming the task")
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                }
+                .disabled(submitting || !hasProtectedTransport)
+            }
+        }
+    }
+
+    private var phoneEntry: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("Enter securely on this phone", systemImage: "lock.shield.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+
+            if preparedSubmission == nil {
+                secureField
+            } else {
+                preparedNotice
+            }
+
+            submitButton
+
+            if preparedSubmission != nil, !submitting, submissionError != nil {
+                Button("Enter a different value") {
+                    discardPreparedSubmission()
+                }
+                .font(.system(size: 13, weight: .medium))
+            }
+
+            Text("Use Apple Passwords, 1Password, Bitwarden, or paste. The value is encrypted for your computer and never added to chat.")
+                .font(.system(size: 13))
+                .foregroundStyle(Color.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+    }
+
+    private var secureField: some View {
+        SecureField(placeholder, text: $value)
+            .id(fieldID)
+            .textContentType(.password)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .privacySensitive()
+            .disabled(submitting)
+            .submitLabel(.done)
+            .onSubmit { submit() }
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .background(
+                Color.secondary.opacity(0.1),
+                in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+            )
+            .accessibilityLabel(label)
+    }
+
+    private var preparedNotice: some View {
+        Label(
+            submitting ? "Encrypted and saving…" : "Encrypted and ready to retry",
+            systemImage: "lock.fill"
+        )
+        .font(.system(size: 13))
+        .foregroundStyle(Color.secondary)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .padding(.horizontal, 12)
+        .background(
+            Color.secondary.opacity(0.1),
+            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+        )
+    }
+
+    private var submitButton: some View {
+        Button(action: submit) {
+            HStack(spacing: 7) {
+                if submitting { ProgressView().tint(.white) }
+                Image(systemName: "lock.fill")
+                Text(
+                    submitting
+                        ? "Saving securely…"
+                        : preparedSubmission == nil ? "Save securely" : "Try again securely"
+                )
+            }
+            .font(.system(size: 14, weight: .semibold))
+            .frame(maxWidth: .infinity, minHeight: 42)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(tint)
+        .disabled(!canSubmit)
+    }
+
+    private var pairAgainNotice: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("Pair again to enter here", systemImage: "qrcode")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+            Text("This pairing predates secure phone entry. Scan a fresh QR from OpenMausBot, or finish this request on your computer.")
+                .font(.system(size: 13))
+                .foregroundStyle(Color.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+    }
+
+    private var secureConnectionNotice: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("Secure connection required", systemImage: "lock.shield.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+            Text("Switch to Secure phone access (HTTPS) or Tailscale, then try again. You can still finish this request on your computer.")
+                .font(.system(size: 13))
+                .foregroundStyle(Color.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+    }
+
+    /// A different request landed in this card: start clean, with whatever
+    /// envelope the session already holds for it.
+    private func resetForNewRequest() {
+        resetSensitiveState(clearPrepared: true)
+        preparedSubmission = actions.preparedCredential(message: message, secret: secret)
+        submitted = false
+    }
+
     private func submit() {
         guard canSubmit else { return }
         submissionError = nil
@@ -2346,9 +2861,8 @@ struct CredentialRequestCardView: View {
         do {
             // Encryption happens synchronously. No task closure ever captures
             // the cleartext, and the native field is replaced immediately.
-            let prepared = try session.prepareCredential(
+            let prepared = try actions.prepareCredential(
                 value,
-                chat: chat,
                 message: message,
                 secret: secret
             )
@@ -2371,7 +2885,7 @@ struct CredentialRequestCardView: View {
 
         submissionTask = Task { @MainActor in
             do {
-                try await session.provideCredential(prepared)
+                try await actions.provideCredential(prepared)
                 guard !Task.isCancelled, activeSubmissionID == submissionID else { return }
                 submitted = true
                 Haptics.success()
@@ -2412,7 +2926,7 @@ struct CredentialRequestCardView: View {
     private func resetSensitiveState(clearPrepared: Bool) {
         suspendSensitiveEntry()
         if clearPrepared, let preparedSubmission {
-            session.discardPreparedCredential(preparedSubmission)
+            actions.discardPreparedCredential(preparedSubmission)
             self.preparedSubmission = nil
         }
     }
@@ -2428,10 +2942,16 @@ struct CredentialRequestCardView: View {
 /// screen the companion exists for — a bot stopped, and only a person can
 /// let it continue.
 struct CardView: View {
-    let chat: Chat
     let message: Message
-    @EnvironmentObject private var session: Session
+    let context: TranscriptRowContext
+    let actions: TranscriptActions
     @State private var answering = false
+    /// The full request behind a short card. Collapsed until asked for, and
+    /// again whenever the card is drawn afresh.
+    @State private var showingDetails = false
+    /// A question's answer in the person's own words.
+    @State private var typedAnswer = ""
+    @FocusState private var answerFocused: Bool
 
     /// The option this card offers that means "go ahead".
     ///
@@ -2453,26 +2973,43 @@ struct CardView: View {
     /// choice above so the two cannot drift apart.
     private static func isRefusal(_ option: String) -> Bool { OptionCard.isRefusal(option) }
 
-    private var tint: Color { MausPalette.color(chat.color) }
+    private var tint: Color { MausPalette.color(context.color) }
 
     var body: some View {
         if let card = message.card {
             VStack(alignment: .leading, spacing: 10) {
                 if card.isPending {
-                    Label("\(chat.name) is waiting on you", systemImage: "hand.raised.fill")
+                    Label("\(context.name) is waiting on you", systemImage: "hand.raised.fill")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(tint)
                 }
-                Text(card.title)
+                headline(card)
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(Color.primary)
                     .fixedSize(horizontal: false, vertical: true)
-                if !card.subtitle.isEmpty {
-                    Text(card.subtitle)
-                        .font(.system(size: 15))
-                        .foregroundStyle(Color.secondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                if card.presentation == .standard {
+                    // Proposals are reviewed in full before anyone confirms them.
+                    if !card.subtitle.isEmpty {
+                        Text(card.subtitle)
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    // An approval leads with one line; the request itself,
+                    // raw arguments and all, waits under Details.
+                    if !card.summaryLine.isEmpty {
+                        Text(card.summaryLine)
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.secondary)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("approval-summary")
+                    }
+                    if card.hasDetails {
+                        details(card.subtitle)
+                    }
                 }
 
                 if let skill = card.skillRequest {
@@ -2511,59 +3048,49 @@ struct CardView: View {
                     }
                 }
 
-                if let held = card.held {
+                if card.showsHeldNote, let held = card.held {
                     Label(held, systemImage: "exclamationmark.shield")
                         .font(.system(size: 13))
                         .foregroundStyle(.orange)
                 }
 
                 if card.isPending {
-                    HStack(spacing: 8) {
-                        ForEach(card.options, id: \.self) { option in
-                            Button {
-                                Haptics.selection()
-                                answering = true
-                                Task {
-                                    await session.answer(chat: chat, card: card, choice: option)
-                                    answering = false
+                    // A question's answers are sentences: one under another,
+                    // full width, wrapping. Allow and Deny share a row.
+                    Group {
+                        if card.stacksOptions {
+                            VStack(spacing: 8) {
+                                ForEach(card.options, id: \.self) { option in
+                                    optionButton(option, card: card, stacked: true)
                                 }
-                            } label: {
-                                Text(option)
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 40)
-                                    .background(
-                                        Capsule().fill(Self.isRefusal(option) ? Color.secondary.opacity(0.18) : tint)
-                                    )
                             }
-                            .buttonStyle(.plain)
-                            .disabled(
-                                answering ||
-                                    (card.skillRequest != nil && !Self.isRefusal(option) &&
-                                        card.skillRequest?.reviewedSha256 == nil)
-                            )
+                            .accessibilityIdentifier("card-options-stacked")
+                        } else {
+                            HStack(spacing: 8) {
+                                ForEach(card.options, id: \.self) { option in
+                                    optionButton(option, card: card, stacked: false)
+                                }
+                            }
                         }
                     }
                     .padding(.top, 2)
+
+                    if card.takesTypedAnswer {
+                        typedAnswerField(card)
+                    }
 
                     // The grant key comes from the card. The phone never
                     // derives its own, so it cannot permit something subtly
                     // wider than the computer would have. The same goes for
                     // the answer: it is one of the options the card offered,
                     // never a string invented here.
-                    if card.allowKey != nil, let allow = allowChoice, case let .bot(bot) = chat {
+                    if card.allowKey != nil, let allow = allowChoice, context.isBot {
                         Button("Always allow this tool") {
                             Haptics.selection()
                             answering = true
                             Task {
-                                await session.alwaysAllow(bot: bot, card: card)
-                                await session.answer(
-                                    chat: chat,
-                                    card: card,
-                                    choice: allow,
-                                    rememberingPermission: false
-                                )
+                                await actions.alwaysAllow(card)
+                                await actions.answer(card, choice: allow, rememberingPermission: false)
                                 answering = false
                             }
                         }
@@ -2572,10 +3099,16 @@ struct CardView: View {
                         .frame(maxWidth: .infinity)
                         .disabled(answering)
                     }
-                } else if let answered = card.answered {
-                    Label(answered, systemImage: "checkmark.circle")
-                        .font(.system(size: 14))
-                        .foregroundStyle(Color.secondary)
+                } else if let outcome = card.outcome {
+                    Label {
+                        outcomeText(outcome)
+                    } icon: {
+                        Image(systemName: Self.outcomeSymbol(outcome))
+                    }
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color.secondary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("approval-outcome")
                 } else if card.expired == true {
                     Label("Expired — ask for a fresh proposal", systemImage: "clock.badge.xmark")
                         .font(.system(size: 14))
@@ -2594,15 +3127,185 @@ struct CardView: View {
             }
         }
     }
+
+    /// One answer. Stacked, it takes the card's width and as many lines as
+    /// its label needs; in a row, it takes an equal share at one height.
+    private func optionButton(_ option: String, card: OptionCard, stacked: Bool) -> some View {
+        let refusal = Self.isRefusal(option)
+        let fill = refusal ? Color.secondary.opacity(0.18) : tint
+        // A capsule around two or three lines reads as a blob; a stacked
+        // answer gets rounded corners instead.
+        let shape = stacked ? AnyShape(RoundedRectangle(cornerRadius: 20, style: .continuous)) : AnyShape(Capsule())
+        return Button {
+            Haptics.selection()
+            answering = true
+            Task {
+                await actions.answer(card, choice: option)
+                answering = false
+            }
+        } label: {
+            Text(option)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(refusal ? Color.primary : .white)
+                .multilineTextAlignment(stacked ? .center : .leading)
+                .fixedSize(horizontal: false, vertical: stacked)
+                .padding(.horizontal, stacked ? 16 : 0)
+                .padding(.vertical, stacked ? 10 : 0)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: stacked ? 44 : 40, maxHeight: stacked ? nil : 40)
+                .background(shape.fill(fill))
+                .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .disabled(
+            answering ||
+                (card.skillRequest != nil && !refusal && card.skillRequest?.reviewedSha256 == nil)
+        )
+    }
+
+    /// A question also takes words: under its options, or on its own when it
+    /// offered none (the computer's `ask_user` with no choices, which left
+    /// nothing to tap). Sent the way the buttons are, as the answer's text.
+    private func typedAnswerField(_ card: OptionCard) -> some View {
+        let prompt: LocalizedStringKey = card.options.isEmpty ? "Type your answer" : "Type your own answer"
+        let ready = !typedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !answering
+        return HStack(alignment: .bottom, spacing: 8) {
+            TextField(prompt, text: $typedAnswer, axis: .vertical)
+                .font(.system(size: 15))
+                .lineLimit(1...4)
+                .textFieldStyle(.plain)
+                .focused($answerFocused)
+                .padding(.vertical, 10)
+                .disabled(answering)
+                .accessibilityIdentifier("card-answer-field")
+            Button {
+                sendTypedAnswer(card)
+            } label: {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(ready ? Color.white : Color.secondary)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(ready ? tint : Color.secondary.opacity(0.18)))
+            }
+            .buttonStyle(.plain)
+            .disabled(!ready)
+            .padding(.bottom, 6)
+            .accessibilityLabel("Submit answer")
+            .accessibilityIdentifier("card-answer-send")
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color.secondary.opacity(0.10))
+        )
+    }
+
+    /// Once the computer takes the answer the card stays still until it
+    /// settles and shows the words; a failed send keeps them for a retry.
+    private func sendTypedAnswer(_ card: OptionCard) {
+        let typed = typedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty, !answering else { return }
+        Haptics.selection()
+        answering = true
+        answerFocused = false
+        Task {
+            switch await actions.answer(card, inWords: typed) {
+            case .answered:
+                break
+            case .gone:
+                answering = false
+            case .failed:
+                answering = false
+            }
+        }
+    }
+
+    /// "Send to Linear?" for a held send to one app, the generic question
+    /// for several, and the computer's own title for every other card.
+    private func headline(_ card: OptionCard) -> Text {
+        guard card.presentation == .outbound else { return Text(verbatim: card.title) }
+        if let app = card.outboundApp { return Text("Send to \(app)?") }
+        return Text("Send on your behalf?")
+    }
+
+    /// Long requests scroll inside a capped box; short ones just show.
+    private static let detailsScrollThreshold = 480
+
+    private func details(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showingDetails.toggle() }
+            } label: {
+                HStack(spacing: 4) {
+                    Text("Details")
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .rotationEffect(.degrees(showingDetails ? 90 : 0))
+                }
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("approval-details-toggle")
+            .accessibilityAddTraits(showingDetails ? .isSelected : [])
+
+            if showingDetails {
+                let request = Text(verbatim: text)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Color.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Group {
+                    if text.count > Self.detailsScrollThreshold {
+                        ScrollView(.vertical) { request }
+                            .frame(height: 220)
+                    } else {
+                        request.fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(10)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityIdentifier("approval-details")
+            }
+        }
+    }
+
+    private func outcomeText(_ outcome: OptionCard.Outcome) -> Text {
+        switch outcome {
+        case .allowed: return Text("Allowed")
+        case .denied: return Text("Denied")
+        case .unavailable: return Text("No longer available")
+        case .remembered: return Text("Remembered")
+        case .skipped: return Text("Skipped")
+        case let .answered(text): return text.isEmpty ? Text("Answered") : Text(verbatim: text)
+        case let .chose(option, _): return Text(verbatim: option)
+        case let .other(value): return Text(verbatim: value)
+        }
+    }
+
+    private static func outcomeSymbol(_ outcome: OptionCard.Outcome) -> String {
+        outcome.isPositive ? "checkmark.circle" : "xmark.circle"
+    }
 }
 
 /// A frame of the bot's computer. In the paged shape the pixels are not in
 /// the transcript — they are fetched here, once, when the row appears.
+///
+/// Decoded off the main actor at the width it is drawn (`ScreenShotImages`),
+/// not in full on the main actor: a desktop frame is about 16 MB as a full
+/// bitmap, and an open chat used to keep every one it had shown.
 struct ScreenShot: View {
-    let threadId: String
     let message: Message
-    @EnvironmentObject private var session: Session
+    let actions: TranscriptActions
+    @Environment(\.displayScale) private var displayScale
+    /// The width the frame is drawn at, once laid out.
+    @State private var width: CGFloat = 0
     @State private var image: UIImage?
+    /// The pixel width `image` was decoded for.
+    @State private var decodedWidth = 0
+
+    private var pixelWidth: Int { Int((width * displayScale).rounded(.up)) }
 
     var body: some View {
         Group {
@@ -2618,18 +3321,30 @@ struct ScreenShot: View {
                     .overlay { ProgressView() }
             }
         }
-        .task {
-            guard image == nil else { return }
-            let data: Data?
-            if let inline = message.png, let decoded = Data(base64Encoded: inline) {
-                data = decoded
-            } else if message.hasImage == true {
-                data = await session.image(threadId: threadId, messageId: message.id)
-            } else {
-                data = nil
-            }
-            image = data.flatMap(UIImage.init(data:))
+        // Size only, so this fires on a rotation and not on every scroll.
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+        .task(id: "\(message.id)|\(pixelWidth)") { await load(pixelWidth: pixelWidth) }
+    }
+
+    private func load(pixelWidth: Int) async {
+        guard pixelWidth > 0, pixelWidth != decodedWidth else { return }
+        if let cached = ScreenShotImages.cached(messageId: message.id, pixelWidth: pixelWidth) {
+            image = cached
+            decodedWidth = pixelWidth
+            return
         }
+        var data: Data?
+        if let inline = message.png {
+            data = await ScreenShotImages.data(fromBase64: inline)
+        }
+        if data == nil, message.hasImage == true {
+            data = await actions.screenshot(messageId: message.id)
+        }
+        guard let data, !Task.isCancelled else { return }
+        let decoded = await ScreenShotImages.decode(data, messageId: message.id, pixelWidth: pixelWidth)
+        guard let decoded, !Task.isCancelled else { return }
+        image = decoded
+        decodedWidth = pixelWidth
     }
 }
 
@@ -2685,6 +3400,33 @@ struct StreamingBubble: View {
         // No `.textSelection` on purpose: selecting text that is still growing
         // fights the reader, and the settled bubble a frame later is
         // selectable anyway.
+    }
+}
+
+/// What a working bot is saying, at Hidden: one grey line above the composer,
+/// replaced by each new message, instead of a bubble per message.
+private struct LiveStatusLine: View {
+    let text: String
+    /// The in-between message the line is showing. The line animates when
+    /// a new one lands, not on every batch of a streaming reply (20 a
+    /// second, each starting an animation over the last).
+    let step: String?
+
+    var body: some View {
+        // No spinner of its own: the typing bubble in the transcript says
+        // the bot is working, and this line says what at.
+        HStack(spacing: 8) {
+            Text(verbatim: text.replacingOccurrences(of: "\n", with: " "))
+                .font(.system(size: 13))
+                .foregroundStyle(Color.secondary)
+                .lineLimit(1)
+                .truncationMode(.head)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .animation(.easeOut(duration: 0.15), value: step)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("live-status-line")
     }
 }
 
@@ -2758,5 +3500,61 @@ private struct QueuedSendList: View {
         .padding(.horizontal, 4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(sends.count == 1 ? "1 queued message" : "\(sends.count) queued messages")
+    }
+}
+
+/// The names an @ can tag, above the composer while one is being typed.
+/// Tapping writes the exact name, so the harness's routing always matches
+/// and autocorrect never touches it.
+private struct MentionPicker: View {
+    let choices: [MentionChoice]
+    let bots: [Bot]
+    let pick: (MentionChoice) -> Void
+
+    private static let rowHeight: CGFloat = 44
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                ForEach(choices) { choice in
+                    Button { pick(choice) } label: {
+                        HStack(spacing: 10) {
+                            if let bot = bots.first(where: { $0.id == choice.id }) {
+                                BotAvatarView(bot: bot, size: 26)
+                            } else {
+                                Image(systemName: "person.3.fill")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(Color.secondary)
+                                    .frame(width: 26, height: 26)
+                                    .background(Circle().fill(Color.secondary.opacity(0.15)))
+                            }
+                            Text(verbatim: "@" + choice.name)
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(Color.primary)
+                                .lineLimit(1)
+                            if choice.isEveryone {
+                                Text("Everyone in this room")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(Color.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 12)
+                        .frame(height: Self.rowHeight)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("mention-\(choice.id)")
+                }
+            }
+        }
+        // Four rows, then it scrolls: a big room stays reachable without
+        // the list climbing over the conversation.
+        .frame(height: Self.rowHeight * CGFloat(min(choices.count, 4)))
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Mention someone")
     }
 }

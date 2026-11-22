@@ -97,6 +97,18 @@ public struct CandidateRotation: Equatable, Sendable {
     }
 }
 
+/// An event stream that answered 200 and then ended before its `hello`.
+///
+/// A live stream that later closes is the computer going away, and reopens
+/// on the same route. One that never said hello never connected at all — a
+/// captive page, a proxy, an origin that hangs up — and redialling it forever
+/// strands the phone even when another allowed route reaches the computer.
+/// Port of Android's `MissingStreamHelloException` (#1536).
+public struct StreamClosedBeforeHello: Error, LocalizedError, Equatable, Sendable {
+    public init() {}
+    public var errorDescription: String? { "Lost the connection." }
+}
+
 /// What to do with a connection failure: whether another stored address is
 /// worth trying, and what to tell the person watching the banner.
 public enum ConnectionAdvice {
@@ -127,6 +139,7 @@ public enum ConnectionAdvice {
     /// family Cloudflare can return when a tunnel or its origin is unhealthy.
     /// Application errors such as 400/401/500 deliberately stay put.
     public static func shouldTryAnotherRoute(after error: Error) -> Bool {
+        if error is StreamClosedBeforeHello { return true }
         if let urlError = error as? URLError {
             return shouldTryAnotherHost(urlError.code)
         }
@@ -194,6 +207,41 @@ public enum ConnectionAdvice {
         return advice + fallback + " The app keeps retrying automatically."
     }
 
+    /// As above, from the whole error: an app whose cellular data is turned
+    /// off in Settings fails as "not connected" only off Wi-Fi, which reads
+    /// as "works on Wi-Fi, never on 5G" unless the banner names the switch.
+    public static func message(
+        for error: URLError,
+        host: String,
+        port: Int,
+        tryingNext next: String? = nil
+    ) -> String {
+        if error.code == .notConnectedToInternet, error.networkUnavailableReason == .cellular {
+            return "Cellular data is off for MausBot. Turn it on in Settings → MausBot → Cellular Data, or join Wi-Fi."
+        }
+        return message(for: error.code, host: host, port: port, tryingNext: next)
+    }
+
+    /// A stream the route answered and then refused or dropped — a firewall
+    /// or bot challenge in front of the tunnel, a captive portal, a proxy.
+    /// Named for the route, because the computer itself never saw it.
+    public static func message(
+        forStreamFailure error: Error,
+        host: String,
+        tryingNext next: String? = nil
+    ) -> String? {
+        let fallback = next.map { " Trying \($0) next." } ?? ""
+        let advice: String
+        if error is StreamClosedBeforeHello {
+            advice = "\(host) answered but closed the connection before it started."
+        } else if let apiError = error as? APIError, case let .status(code, _) = apiError, code != 401 {
+            advice = "The route through \(host) refused the live connection (HTTP \(code))."
+        } else {
+            return nil
+        }
+        return advice + fallback + " The app keeps retrying automatically."
+    }
+
     public static func message(
         forGatewayStatus code: Int,
         host: String,
@@ -232,30 +280,63 @@ extension Connection {
     }
 
     /// Bind a new pairing to the route the QR/manual choice actually selected.
-    /// Other fallback addresses in a typed invite are advisory, not fresh
-    /// consent. Hosted HTTPS is always retained as a safe future upgrade.
-    public mutating func establishRoutePolicyFromInvite() {
+    /// Hosted HTTPS is always retained as a safe future upgrade.
+    ///
+    /// `everyLocalRoute` is for the desktop's own pairing QR. When that leads
+    /// with a local address, the person is confirming this computer on this
+    /// network, and the desktop cannot know which of its addresses the phone
+    /// can reach: a Windows PC lists WSL's and Hyper-V's virtual adapters
+    /// beside its Wi-Fi. Every local address the QR carries is then consented
+    /// for the one-time pairing walk (`pairingEndpoints`), and
+    /// `pinRouteConsent(afterPairingThrough:invite:)` narrows it to the one
+    /// that answered before the device token is stored. A typed or discovered
+    /// address stays exactly one.
+    public mutating func establishRoutePolicyFromInvite(everyLocalRoute: Bool = false) {
         let selected = activeEndpoint ?? CompanionEndpoint.direct(
             host: host,
             port: port,
             priority: 0
         )
-        switch selected {
-        case let endpoint? where endpoint.kind == .hosted:
-            allowedRouteKinds = [.hosted]
-            allowedLocalRouteURLs = []
-        case let endpoint? where endpoint.kind == .tailnet:
-            allowedRouteKinds = [.tailnet, .hosted]
-            allowedLocalRouteURLs = []
-        case let endpoint?:
-            allowedRouteKinds = [endpoint.kind, .hosted]
-            allowedLocalRouteURLs = [endpoint.url]
-        case nil:
+        let invited = everyLocalRoute
+            ? (endpoints ?? []) + (hosts ?? []).compactMap {
+                CompanionEndpoint.direct(host: $0, port: port, priority: 0)
+            }
+            : []
+        consent(to: selected, alsoLocal: invited)
+    }
+
+    /// After a pairing walk, bind consent to one route again: the local
+    /// address that redeemed the credential (`winner`), or — when a protected
+    /// route redeemed it — the `invite`'s selected route, exactly as a
+    /// single-route invite always was. The device token then never reaches a
+    /// local address this phone did not pair through.
+    public mutating func pinRouteConsent(afterPairingThrough winner: CompanionEndpoint?, invite: Connection) {
+        let local = winner.flatMap { $0.protectsCredentials ? nil : $0 }
+        consent(
+            to: local ?? invite.activeEndpoint
+                ?? CompanionEndpoint.direct(host: invite.host, port: invite.port, priority: 0),
+            alsoLocal: []
+        )
+    }
+
+    /// Consent to `selected` and hosted HTTPS; when `selected` is local, also
+    /// to the local routes among `others`. Persisted fields are filtered too,
+    /// not only the views read from them.
+    private mutating func consent(to selected: CompanionEndpoint?, alsoLocal others: [CompanionEndpoint]) {
+        let local = selected.map { selected in
+            selected.securityClass == .explicitLocal
+                ? ([selected] + others).filter { $0.securityClass == .explicitLocal }
+                : []
+        } ?? []
+        switch selected?.kind {
+        case .hosted?, nil:
             // A valid Connection always has a direct representation, but
             // fail closed to hosted if a corrupted value reaches this helper.
             allowedRouteKinds = [.hosted]
-            allowedLocalRouteURLs = []
+        case let kind?:
+            allowedRouteKinds = Set([kind, .hosted] + local.map(\.kind))
         }
+        allowedLocalRouteURLs = Set(local.map(\.url))
         if let endpoints {
             self.endpoints = Array(endpointsAllowedByRoutePolicy(endpoints).prefix(8))
         }
@@ -387,6 +468,25 @@ extension Connection {
     /// select; the transport ratchet then removes unsafe cleartext fallbacks.
     public var automaticEndpoints: [CompanionEndpoint] {
         CompanionEndpoint.automaticCandidates(from: orderedEndpoints)
+    }
+
+    /// The routes the one-time pairing walk may try, in the desktop's order.
+    /// Unlike `automaticEndpoints`, every consented local address is tried,
+    /// not only the first: consent is already exact here (see
+    /// `establishRoutePolicyFromInvite(everyLocalRoute:)`). When a protected
+    /// route leads, cleartext still never follows it.
+    public var pairingEndpoints: [CompanionEndpoint] {
+        let routes = orderedEndpoints
+        guard allowedRouteKinds != nil, routes.first?.protectsCredentials == false else {
+            return automaticEndpoints
+        }
+        return routes
+    }
+
+    /// How many more of this computer's addresses a pairing will try beyond
+    /// the one shown on the confirmation.
+    public var otherPairingAddressCount: Int {
+        (allowedLocalRouteURLs ?? []).filter { $0 != pairingConsentOrigin }.count
     }
 
     /// Apply an authenticated endpoint snapshot. The caller owns the exact

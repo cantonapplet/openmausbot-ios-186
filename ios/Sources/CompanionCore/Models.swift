@@ -67,6 +67,17 @@ public struct OptionCard: Codable, Hashable, Sendable {
     /// Terminal: the proposal went stale while open. The computer clears
     /// its options and nothing can answer it; a fresh proposal is needed.
     public var expired: Bool? = nil
+    /// `"permission"` or `"question"` on provider asks; absent elsewhere and
+    /// on cards from older computers.
+    public var requestType: String? = nil
+    /// Catalog key for `held` when it is one of the computer's fixed notes
+    /// ("why this asked"); absent when `held` is free text such as an error.
+    public var heldCode: String? = nil
+    /// Present on "Send on your behalf?" cards: an outbound app action the
+    /// computer held for a person. See ApprovalCard.swift.
+    public var outboundRequest: OutboundRequest? = nil
+    /// Present on "Remember this for the team?" cards.
+    public var teamMemoryRequest: TeamMemoryRequest? = nil
 
     /// A card is actionable while it is unanswered and still has a request
     /// behind it. Everything else is transcript.
@@ -101,9 +112,11 @@ public struct OptionCard: Codable, Hashable, Sendable {
     }
 
     /// Shared by all of the app's card surfaces and by Live Activities.
+    /// "Skip" is the team-memory card's refusal; answering it as allow
+    /// would remember the very thing the person skipped.
     public static func isRefusal(_ choice: String) -> Bool {
         let normalized = choice.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["deny", "cancel", "dismiss"].contains(normalized)
+        return ["deny", "cancel", "dismiss", "skip"].contains(normalized)
     }
 
     /// A provider may include the standing grant as an option of its own.
@@ -1145,10 +1158,13 @@ public struct ModelCatalog: Codable, Hashable, Sendable {
 public struct InstanceCapabilities: Codable, Hashable, Sendable {
     public var effortLevels: [String]?
     public var queueing: Bool?
+    /// The engine has computer tools, so it can work on a cloud computer.
+    public var computerMcp: Bool?
 
-    public init(effortLevels: [String]? = nil, queueing: Bool? = nil) {
+    public init(effortLevels: [String]? = nil, queueing: Bool? = nil, computerMcp: Bool? = nil) {
         self.effortLevels = effortLevels
         self.queueing = queueing
+        self.computerMcp = computerMcp
     }
 }
 
@@ -1471,24 +1487,36 @@ public enum RoutineRunLocation: String, CaseIterable, Codable, Hashable, Sendabl
 }
 
 /// Desktop-equivalent run-location availability, derived only from paired-safe
-/// status endpoints. Selecting Cloud VM requires both the host credential and
-/// an available Boat agent. An existing cloud routine remains editable without
-/// silently changing where it runs if that VM is temporarily unavailable.
+/// status endpoints. A cloud routine runs on its bot's own engine, which uses
+/// the cloud computer as a tool, so selecting Cloud VM requires the host's
+/// cloud computers and an available engine with computer tools for that bot:
+/// the rule the desktop and the server apply to the routine's bot. An existing
+/// cloud routine remains editable without silently changing where it runs if
+/// that VM is temporarily unavailable.
 public struct RoutineRunAvailability: Equatable, Sendable {
     public var cloudConfigured: Bool
-    public var cloudInstanceAvailable: Bool
+    /// The available engines that have computer tools, by instance id.
+    public var cloudEngines: Set<String>
+
+    public init(cloudConfigured: Bool, cloudEngines: Set<String>) {
+        self.cloudConfigured = cloudConfigured
+        self.cloudEngines = cloudEngines
+    }
 
     public init(config: ConfigStatus?, instances: [Instance]) {
         cloudConfigured = config?.box?.configured == true
-        cloudInstanceAvailable = instances.contains {
-            $0.driverKind == "boxAgent" && $0.snapshot.isAvailable
-        }
+        cloudEngines = Set(instances.filter {
+            $0.capabilities?.computerMcp == true && $0.snapshot.isAvailable
+        }.map(\.instanceId))
     }
 
-    public var cloudReady: Bool { cloudConfigured && cloudInstanceAvailable }
+    /// Whether a routine for the bot on this engine can run on the Cloud VM.
+    public func cloudReady(engine instanceId: String?) -> Bool {
+        cloudConfigured && instanceId.map(cloudEngines.contains) == true
+    }
 
-    public func canSelect(_ location: RoutineRunLocation, preserving current: RoutineRunLocation) -> Bool {
-        location == .maus || cloudReady || current == .cloud
+    public func canSelect(_ location: RoutineRunLocation, preserving current: RoutineRunLocation, engine instanceId: String?) -> Bool {
+        location == .maus || cloudReady(engine: instanceId) || current == .cloud
     }
 }
 
@@ -1708,13 +1736,19 @@ public struct ServerEnvironment: Codable, Hashable, Sendable {
     public var version: String?
 }
 
-/// Keep future attachment kinds decodable; image entries display inline and
-/// audio entries render as voice notes (Message.voiceNotes). Unknown kinds
-/// decode without breaking, so a newer computer never gaps the transcript.
+/// Keep future attachment kinds decodable; image entries display inline,
+/// file entries (a bot's attach_file: documents, audio, video) show as file
+/// cards (Message.attachedFiles), and audio entries render as voice notes
+/// (Message.voiceNotes). Unknown kinds decode without breaking, so a newer
+/// computer never gaps the transcript.
 public struct MessageImageAttachment: Codable, Hashable, Sendable {
     public var kind: String
     public var path: String?
     public var mime: String?
+    /// The file's name as the bot sent it, for a `kind: "file"` entry.
+    /// Presentation only: it is basenamed before display and never used as
+    /// a path.
+    public var name: String?
     /// The server's duration estimate for an audio attachment, in
     /// milliseconds; shown until the player loads real metadata.
     public var durationMs: Double?
