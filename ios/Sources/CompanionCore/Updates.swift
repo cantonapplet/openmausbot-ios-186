@@ -4,27 +4,51 @@
 // stopped and needs an answer, a bot mid-turn, and a bot that finished with
 // something you have not read. A bot that is idle and read is not an update
 // and never appears here; that is what the roster below is for.
+//
+// The computation lives in Core rather than the app target so the Updates
+// sheet, the Live Activity, and home-screen widgets all consume one
+// definition of "what needs you" and can never disagree; ChatUpdate is
+// Codable so the same value can serialize into a widget snapshot.
 import Foundation
-import CompanionCore
 
-struct ChatUpdate: Identifiable, Hashable {
-    enum Kind: Int, Comparable {
+public struct ChatUpdate: Identifiable, Hashable, Codable {
+    public enum Kind: Int, Comparable, Codable, Sendable {
         case needsYou = 0, working, toReview
-        static func < (a: Kind, b: Kind) -> Bool { a.rawValue < b.rawValue }
+        public static func < (a: Kind, b: Kind) -> Bool { a.rawValue < b.rawValue }
     }
 
-    let chat: Chat
-    let kind: Kind
+    public let chat: Chat
+    public let kind: Kind
     /// One line under the name — the question, what it is doing, or what it said.
-    let line: String
+    public let line: String
     /// The card to answer, when `kind == .needsYou`.
-    let card: OptionCard?
+    public let card: OptionCard?
 
-    var id: String { chat.conversationID }
+    public var id: String { chat.conversationID }
+
+    /// The options a compact surface may offer as one-tap answers: a live
+    /// ask with a real card, minus SKILL.md requests, which must be read in
+    /// the chat before they enable anything. The Updates sheet's pills and
+    /// the widgets' buttons share this one rule, so they can never disagree
+    /// about what is answerable.
+    public var answerOptions: [String] {
+        Self.answerOptions(kind: kind, card: card)
+    }
+
+    /// The rule behind `answerOptions`, in the form a snapshot row can also
+    /// reach: it sees the kind and the card, nothing else.
+    public static func answerOptions(kind: Kind, card: OptionCard?) -> [String] {
+        guard kind == .needsYou, let card, card.isPending, card.skillRequest == nil else { return [] }
+        return card.options
+    }
 }
 
 extension CompanionState {
-    var updates: [ChatUpdate] {
+    /// Every chat worth a line on the pill, the sheet, the island, Live
+    /// Activities, the widget and Walkie. `detail` is the reader's Activity
+    /// setting: these lines fold tool calls and webhooks by the same rule as
+    /// the roster, so Hidden means hidden on every surface (MOCA-204).
+    public func updates(detail: ActivityDetail) -> [ChatUpdate] {
         var out: [ChatUpdate] = []
         var seen = Set<String>()
 
@@ -46,9 +70,9 @@ extension CompanionState {
                 } else if let held = pendingQueued[task.threadId], !held.isEmpty {
                     out.append(ChatUpdate(chat: chat, kind: .working, line: queuedLine(for: held), card: nil))
                 } else if projected.busy == true {
-                    out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: task.threadId), card: nil))
+                    out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: task.threadId, detail: detail), card: nil))
                 } else if projected.unread {
-                    out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(threadId: task.threadId), card: nil))
+                    out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(threadId: task.threadId, detail: detail), card: nil))
                 }
             }
         }
@@ -60,16 +84,16 @@ extension CompanionState {
                 out.append(ChatUpdate(chat: chat, kind: .working, line: queuedLine(for: held), card: nil))
             } else if room.busyBotId != nil {
                 seen.insert(chat.conversationID)
-                out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: room.threadId), card: nil))
+                out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: room.threadId, detail: detail), card: nil))
             } else if room.unread {
                 seen.insert(chat.conversationID)
-                out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(threadId: room.threadId), card: nil))
+                out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(threadId: room.threadId, detail: detail), card: nil))
             }
         }
         return out.sorted { $0.kind < $1.kind }
     }
 
-    func chat(forThread threadId: String) -> Chat? {
+    public func chat(forThread threadId: String) -> Chat? {
         if let bot = bot(forThread: threadId) { return .bot(bot) }
         if let room = room(forThread: threadId) { return .room(room) }
         return nil
@@ -87,24 +111,21 @@ extension CompanionState {
         return "\(held.count) messages queued"
     }
 
-    private func workingLine(threadId: String) -> String {
+    private func workingLine(threadId: String, detail: ActivityDetail) -> String {
         if let live = streaming[threadId], !live.isEmpty {
             return String(live.suffix(120)).replacingOccurrences(of: "\n", with: " ")
         }
-        if let last = visibleTranscript(forThread: threadId).last, last.kind == .activity, let tool = last.tool {
+        // A tool's name is often its raw command line. Only a reader who
+        // wants tool calls sees it; a status notice is for everyone.
+        if let last = visibleTranscript(forThread: threadId).last, last.kind == .activity, let tool = last.tool,
+           detail != .hidden || isStatusNotice(last) {
             return tool.name
         }
         return "Working…"
     }
 
-    private func lastLine(threadId: String) -> String {
-        guard let last = visibleTranscript(forThread: threadId).last else { return "" }
-        switch last.kind {
-        case .text, .unknown: return last.text ?? ""
-        case .options: return last.card?.title ?? ""
-        case .secret: return last.secret?.label ?? last.text ?? "Credential required"
-        case .activity: return last.tool?.name ?? ""
-        case .screen: return "Screenshot"
-        }
+    /// What the chat last said, read by the roster's rule.
+    private func lastLine(threadId: String, detail: ActivityDetail) -> String {
+        rosterPreview(visibleTranscript(forThread: threadId), detail: detail)
     }
 }

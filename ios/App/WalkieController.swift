@@ -42,7 +42,7 @@ extension CompanionState {
     /// disagree about who needs you.
     var walkieRoster: [WalkieAgent] {
         var byBot: [String: ChatUpdate] = [:]
-        for update in updates {
+        for update in updates(detail: .stored) {
             if case let .bot(bot) = update.chat, byBot[bot.id] == nil { byBot[bot.id] = update }
         }
         let rows = bots.filter { $0.hidden != true }.map { bot -> WalkieAgent in
@@ -134,7 +134,7 @@ final class WalkieController: ObservableObject {
         let speech = await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
         }
-        guard speech == .authorized, await AVAudioApplication.requestRecordPermission() else {
+        guard speech == .authorized, await MicrophonePermission.request() else {
             return fail(String(localized: "Walkie needs Microphone and Speech Recognition access. Turn them on in Settings."))
         }
         recognizer = Dictation.localeCandidates()

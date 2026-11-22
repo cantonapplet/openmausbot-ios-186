@@ -6,68 +6,45 @@ import Security
 /// The access group is deliberately explicit on every operation. Omitting
 /// `kSecAttrAccessGroup` silently selects each target's private default group,
 /// which would make a token saved by the app invisible to the share extension.
-///
-/// Builds signed without that entitlement cannot use any access group at all,
-/// so those operations fall back to `OpenMausLocalTokenStore` rather than
-/// failing pairing outright.
 enum OpenMausSharedKeychain {
     private static let service = "com.openmausbot.companion.token"
 
     static func save(_ token: String, for connectionID: String) throws {
-        do {
-            let accessGroup = try requiredAccessGroup()
-            try save(
-                Data(token.utf8),
-                for: connectionID,
-                accessGroup: accessGroup
-            )
-        } catch let error as OpenMausSharedKeychainError where error.isEntitlementUnavailable {
-            guard OpenMausLocalTokenStore.save(token, for: connectionID) else {
-                throw error
-            }
-        }
+        let accessGroup = try requiredAccessGroup()
+        try save(
+            Data(token.utf8),
+            for: connectionID,
+            accessGroup: accessGroup
+        )
     }
 
     /// The stored token: nil only when there genuinely is not one.
     /// Locked or misconfigured keychains throw so callers never turn a
-    /// temporary inability to read protected data into an accidental unpair;
-    /// a build without the access-group entitlement reads the sandbox file.
+    /// temporary inability to read protected data into an accidental unpair.
     static func token(for connectionID: String) throws -> String? {
-        do {
-            let accessGroup = try requiredAccessGroup()
-            return try readToken(for: connectionID, accessGroup: accessGroup)
-        } catch let error as OpenMausSharedKeychainError where error.isEntitlementUnavailable {
-            return OpenMausLocalTokenStore.token(for: connectionID)
-        }
+        let accessGroup = try requiredAccessGroup()
+        return try readToken(for: connectionID, accessGroup: accessGroup)
     }
 
     @discardableResult
     static func remove(_ connectionID: String) -> Bool {
-        let fileRemoved = OpenMausLocalTokenStore.remove(connectionID)
         guard let accessGroup = OpenMausSharedConfiguration.keychainAccessGroup else {
-            return fileRemoved
+            return false
         }
-        return remove(connectionID, accessGroup: accessGroup) || fileRemoved
+        return remove(connectionID, accessGroup: accessGroup)
     }
 
     /// Main-app upgrade path from the previous app-private keychain item.
     ///
     /// The legacy item is deleted only after the shared item commits. If the
-    /// phone is locked, the old token remains untouched and the error keeps its
-    /// locked-vs-missing meaning; a missing entitlement simply reads as nil.
+    /// phone is locked or the new entitlement is unavailable, the old token
+    /// remains untouched and the error retains its locked-vs-missing meaning.
     static func tokenMigratingLegacyItem(for connectionID: String) throws -> String? {
         if let shared = try token(for: connectionID) { return shared }
-        // Without the shared entitlement the legacy group is refused as well,
-        // so a file already counts as the migrated copy.
-        if let local = OpenMausLocalTokenStore.token(for: connectionID) { return local }
-        guard let legacyGroup = try? requiredLegacyAccessGroup() else { return nil }
-        let legacy: String?
-        do {
-            legacy = try readToken(for: connectionID, accessGroup: legacyGroup)
-        } catch let error as OpenMausSharedKeychainError where error.isEntitlementUnavailable {
+        let legacyGroup = try requiredLegacyAccessGroup()
+        guard let legacy = try readToken(for: connectionID, accessGroup: legacyGroup) else {
             return nil
         }
-        guard let legacy else { return nil }
         try save(legacy, for: connectionID)
         _ = remove(connectionID, accessGroup: legacyGroup)
         return legacy
@@ -80,7 +57,7 @@ enum OpenMausSharedKeychain {
     static func removeIncludingLegacyItem(_ connectionID: String) -> Bool {
         let sharedRemoved = remove(connectionID)
         guard let legacyGroup = OpenMausSharedConfiguration.legacyAppKeychainAccessGroup else {
-            return sharedRemoved
+            return false
         }
         let legacyRemoved = remove(connectionID, accessGroup: legacyGroup)
         return sharedRemoved && legacyRemoved
@@ -187,17 +164,6 @@ enum OpenMausSharedKeychainError: LocalizedError {
         case let .security(status):
             let detail = SecCopyErrorMessageString(status, nil) as String? ?? "status \(status)"
             return "Couldn't access the pairing securely: \(detail)"
-        }
-    }
-
-    /// The build is signed without the access group, so the keychain refuses
-    /// the request outright and a sandbox file has to take over.
-    var isEntitlementUnavailable: Bool {
-        switch self {
-        case .configurationMissing:
-            return true
-        case let .security(status):
-            return status == errSecMissingEntitlement
         }
     }
 
