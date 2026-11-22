@@ -1,0 +1,46 @@
+name: unsigned ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build unsigned app
+        working-directory: ios
+        run: |
+          xcodebuild -project OpenMausCompanion.xcodeproj \
+            -scheme OpenMausCompanion \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package ipa
+        run: |
+          mkdir -p out/Payload
+          cp -R ios/build/Build/Products/Release-iphoneos/OpenMausCompanion.app out/Payload/
+          cd out
+          zip -qry OpenMausBot-1.86-unsigned.ipa Payload
+          ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenMausBot-1.86-unsigned-ipa
+          path: out/OpenMausBot-1.86-unsigned.ipa
+          if-no-files-found: error
