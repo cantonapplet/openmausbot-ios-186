@@ -6,7 +6,7 @@ import Foundation
 /// the app and extension. The matching capabilities still live in the Xcode
 /// project, where iOS verifies them against the provisioning profile.
 enum OpenMausSharedConfiguration {
-    static let appGroupIdentifier = "group.com.openmausbot.shared"
+    static let appGroupIdentifier = "group.com.cantonapplet.openmausbot.shared"
     static let legacyAppBundleIdentifier = "com.openmausbot.app"
     static let keychainAccessGroupInfoKey = "OpenMausKeychainAccessGroup"
 
