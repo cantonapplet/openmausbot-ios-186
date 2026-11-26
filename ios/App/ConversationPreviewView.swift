@@ -16,7 +16,7 @@ struct ConversationPreviewView: View {
         Array(
             session.state.visibleTranscript(forThread: bot.threadId)
                 .filter { $0.kind == .text && !($0.text ?? "").isEmpty }
-                .suffix(10)
+                .suffix(4)
         )
     }
 
@@ -50,50 +50,70 @@ struct ConversationPreviewView: View {
             Rectangle()
                 .fill(Color.primary.opacity(0.08))
                 .frame(height: 0.5)
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(messages) { message in
-                    TextBubble(
-                        message: message,
-                        presentation: MessagePresentations.of(message),
-                        context: context,
-                        actions: actions
-                    )
+            GeometryReader { geo in
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Spacer(minLength: 0)
+                            ForEach(messages) { message in
+                                TextBubble(
+                                    message: message,
+                                    presentation: MessagePresentations.of(message),
+                                    context: context,
+                                    actions: actions
+                                )
+                                .id(message.id)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("preview.end")
+                        }
+                        .frame(minHeight: geo.size.height, alignment: .bottom)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 10)
+                        .padding(.bottom, 12)
+                    }
+                    .scrollDisabled(true)
+                    .scrollIndicators(.hidden)
+                    .onAppear {
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("preview.end", anchor: .bottom)
+                        }
+                    }
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-            .clipped()
+            .frame(maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: height)
+        .frame(width: UIScreen.main.bounds.width - 32)
+        .frame(height: 375)
         .background(Color.appBackground)
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-        .contentShape(Rectangle())
-        .onTapGesture { onOpen() }
-        .accessibilityAddTraits(.isButton)
-        .accessibilityLabel("Open \(bot.name)")
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Conversation with \(bot.name)")
     }
 
     private var header: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             ChatAvatarView(
                 chat: .bot(bot),
-                size: 44,
+                size: 28,
                 state: MausState.forBot(bot, last: session.state.lastVisibleMessage(forThread: bot.threadId)),
                 animated: false
             )
-            VStack(alignment: .leading, spacing: 2) {
-                Text(bot.name)
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(.primary)
-                Text(bot.title.isEmpty ? "Bot" : bot.title)
+            Text(bot.name)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            if !bot.title.isEmpty {
+                Text(bot.title)
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
     }
 }

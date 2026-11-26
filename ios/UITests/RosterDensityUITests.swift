@@ -12,44 +12,31 @@ final class RosterDensityUITests: XCTestCase {
         XCTAssertFalse(app.buttons["threads-disclosure.roster-pepper"].exists)
 
         row.press(forDuration: 0.6)
-        let gmail = app.buttons["Triage Gmail"].firstMatch
-        XCTAssertTrue(gmail.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["Triage iCloud"].firstMatch.exists)
-        XCTAssertTrue(app.buttons["Plan weekend"].firstMatch.exists)
-        XCTAssertTrue(app.buttons["New thread"].firstMatch.exists)
-        XCTAssertTrue(app.buttons["Delete bot"].firstMatch.exists)
+        XCTAssertTrue(app.buttons["Threads"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Pin"].exists)
+        XCTAssertTrue(app.buttons["Bot settings"].exists)
+        XCTAssertTrue(app.buttons["Delete bot"].exists)
         recordScreenshot("Bot long-press menu", in: app)
 
         let settings = app.buttons["Bot settings"].firstMatch
-        XCTAssertTrue(settings.exists)
         settings.tap()
         XCTAssertTrue(app.botSettingsPage.waitForExistence(timeout: 8), "bot settings pushes")
         app.navigationBars.buttons.firstMatch.tap()
         XCTAssertTrue(row.waitForExistence(timeout: 5))
 
         row.press(forDuration: 0.6)
+        app.buttons["Threads"].tap()
+        let gmail = app.buttons["Triage Gmail"].firstMatch
         XCTAssertTrue(gmail.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Triage iCloud"].firstMatch.exists)
+        XCTAssertTrue(app.buttons["Plan weekend"].firstMatch.exists)
+        XCTAssertTrue(app.buttons["New thread"].firstMatch.exists)
+        recordScreenshot("Threads submenu", in: app)
         gmail.tap()
         assertThread("Triage Gmail", in: app)
         app.buttons["Back"].tap()
         XCTAssertTrue(row.waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["threads-disclosure.roster-pepper"].exists)
-    }
-
-    @MainActor
-    func testLongPressPreviewOpensTheConversation() {
-        let app = launchRoster()
-        let row = app.buttons["chat-row.roster-pepper"]
-        XCTAssertTrue(row.waitForExistence(timeout: 10))
-        row.press(forDuration: 0.6)
-
-        let preview = app.buttons["Open Pepper"].firstMatch
-        XCTAssertTrue(preview.waitForExistence(timeout: 5), "the conversation preview is up")
-        preview.tap()
-
-        let header = app.buttons["header-bot-actions"]
-        XCTAssertTrue(header.waitForExistence(timeout: 10), "the preview opens the chat")
-        recordScreenshot("Preview opened the conversation", in: app)
     }
 
     @MainActor

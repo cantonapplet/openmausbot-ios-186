@@ -19,7 +19,6 @@ struct ChatListView: View {
     /// bottom of the roster is a poor answer to pressing +.
     @State private var path = NavigationPath()
     @State private var searchHits: [SearchHit] = []
-    @State private var botActions: BotActionTarget?
     @AppStorage(PrefKey.updatesPill) private var updatesPill = false
 #if DEBUG
     @State private var showingGlassGallery = ProcessInfo.processInfo.arguments.contains("-glass-gallery")
@@ -166,7 +165,6 @@ struct ChatListView: View {
             .frame(maxWidth: CompanionLayout.rosterWidth, maxHeight: .infinity, alignment: .top)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .background(Color.appBackground.ignoresSafeArea())
-            .overlay(alignment: .center) { botActionsOverlay }
             // a bot that stopped for you grows out of the island
             .overlay(alignment: .top) {
                 if CompanionLayout.supportsIslandPresentation {
@@ -495,13 +493,8 @@ struct ChatListView: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .highPriorityGesture(
-                                LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                                    presentBotActions(bot, chat: summary.chat)
-                                }
-                            )
-                            .accessibilityAction(named: "Bot actions") {
-                                presentBotActions(bot, chat: summary.chat)
+                            .contextMenu { rosterMenu(for: bot) } preview: {
+                                ConversationPreviewView(bot: bot, session: session)
                             }
                             .accessibilityIdentifier("chat-row.\(summary.chat.id)")
                         }
@@ -743,16 +736,20 @@ struct ChatListView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("chat-row.\(entry.id)")
-                .highPriorityGesture(
-                    LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                        if case let .bot(bot) = entry.row.chat {
-                            presentBotActions(bot, chat: entry.row.chat)
-                        }
-                    }
-                )
-                .accessibilityAction(named: "Bot actions") {
+                .contextMenu {
                     if case let .bot(bot) = entry.row.chat {
-                        presentBotActions(bot, chat: entry.row.chat)
+                        rosterMenu(for: bot)
+                    }
+                } preview: {
+                    if case let .bot(bot) = entry.row.chat {
+                        ConversationPreviewView(bot: bot, session: session)
+                    } else {
+                        entry.row
+                            .padding(.vertical, 2)
+                            .background(
+                                Color.appBackground,
+                                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            )
                     }
                 }
 
@@ -813,65 +810,61 @@ struct ChatListView: View {
         ))
     }
 
+    /// The native Haptic Touch menu: threads (and starting one) live in a
+    /// submenu, the way a system menu expands them in place.
     @ViewBuilder
-    private var botActionsOverlay: some View {
-        if let target = botActions {
-            BotActionsOverlay(
-                bot: target.bot,
-                chat: target.chat,
-                threads: target.bot.visibleTasks,
-                session: session,
-                onOpen: { openFromBotActions(target.chat) },
-                onOpenThread: { openFromBotActions($0) },
-                onPin: {
-                    dismissBotActions()
-                    Task { await session.setBotPinned(target.bot, pinned: target.bot.pinned != true) }
-                },
-                onSettings: {
-                    dismissBotActions()
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(180))
-                        profileBot = target.bot
+    private func rosterMenu(for bot: Bot) -> some View {
+        let threads = bot.visibleTasks
+        Menu {
+            ForEach(threads, id: \.threadId) { task in
+                Button {
+                    Haptics.selection()
+                    if let projected = bot.projected(forThread: task.threadId) {
+                        path.append(Chat.bot(projected))
                     }
-                },
-                onNewThread: {
-                    dismissBotActions()
-                    Task {
-                        if let created = await session.createRosterThread(for: target.bot) {
-                            path.append(Chat.bot(created))
-                        }
+                } label: {
+                    Text(task.displayTitle)
+                }
+            }
+            if !threads.isEmpty { Divider() }
+            Button {
+                Haptics.selection()
+                Task {
+                    if let created = await session.createRosterThread(for: bot) {
+                        path.append(Chat.bot(created))
                     }
-                },
-                onDelete: {
-                    dismissBotActions()
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(180))
-                        botPendingDeletion = target.bot
-                    }
-                },
-                onDismiss: { dismissBotActions() }
-            )
-            .zIndex(30)
-            .transition(.opacity)
+                }
+            } label: {
+                Label("New thread", systemImage: "plus")
+            }
+        } label: {
+            Label("Threads", systemImage: "bubble.left.and.bubble.right")
         }
-    }
 
-    private func presentBotActions(_ bot: Bot, chat: Chat) {
-        Haptics.impact(.medium)
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
-            botActions = BotActionTarget(bot: bot, chat: chat)
+        Button {
+            Haptics.selection()
+            Task { await session.setBotPinned(bot, pinned: bot.pinned != true) }
+        } label: {
+            Label(bot.pinned == true ? "Unpin" : "Pin", systemImage: bot.pinned == true ? "pin.slash" : "pin")
         }
-    }
-
-    private func dismissBotActions() {
-        withAnimation(.easeOut(duration: 0.16)) { botActions = nil }
-    }
-
-    private func openFromBotActions(_ chat: Chat) {
-        dismissBotActions()
-        Task {
-            try? await Task.sleep(for: .milliseconds(160))
-            path.append(chat)
+        Button {
+            Haptics.selection()
+            Task {
+                try? await Task.sleep(for: .milliseconds(200))
+                profileBot = bot
+            }
+        } label: {
+            Label("Bot settings", systemImage: "gearshape")
+        }
+        Divider()
+        Button(role: .destructive) {
+            Haptics.selection()
+            Task {
+                try? await Task.sleep(for: .milliseconds(200))
+                botPendingDeletion = bot
+            }
+        } label: {
+            Label("Delete bot", systemImage: "trash")
         }
     }
 
@@ -1586,11 +1579,4 @@ enum RelativeStamp {
         if calendar.isDateInYesterday(date) { return "Yesterday \(time)" }
         return "\(date.formatted(.dateTime.day().month(.abbreviated))) \(time)"
     }
-}
-
-/// The bot whose long-press surface is up, and the thread it should open.
-private struct BotActionTarget: Identifiable {
-    let bot: Bot
-    let chat: Chat
-    var id: String { chat.conversationID }
 }
