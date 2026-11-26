@@ -6,7 +6,15 @@ import Foundation
 /// the app and extension. The matching capabilities still live in the Xcode
 /// project, where iOS verifies them against the provisioning profile.
 enum OpenMausSharedConfiguration {
-    static let appGroupIdentifier = "group.com.cantonapplet.openmausbot.shared"
+    /// The pairing token and the Walkie voice key live in the Keychain when
+    /// this is true. Personal/free provisioning profiles often carry no
+    /// keychain access group at all, so it defaults to the file-backed store:
+    /// first-unlock file protection inside the app sandbox. Set this to true
+    /// only when every target is signed with a team that grants the shared
+    /// keychain group.
+    static let usesKeychain = false
+
+    static let appGroupIdentifier = "group.com.danishellan.mausbot.shared"
     static let legacyAppBundleIdentifier = "com.openmausbot.app"
     static let keychainAccessGroupInfoKey = "OpenMausKeychainAccessGroup"
 

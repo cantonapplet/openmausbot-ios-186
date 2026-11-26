@@ -194,9 +194,22 @@ final class Session: ObservableObject {
     }
 
     private var registry = CompanionConnectionRegistry()
+    /// A bundled preview fixture, not a paired computer. There is no stream
+    /// to dial: attempting one only produces DNS retries and an orange banner,
+    /// and adds seconds to the launch of every fixture-driven UI test.
+    private let previewFixture: Bool
     // MARK: - Pairing
 
-    init() {
+    /// - Parameter restoringSavedConnection: `false` for Xcode previews,
+    ///   which hydrate a fixture and must not dial a real computer.
+    init(restoringSavedConnection: Bool = true) {
+#if DEBUG
+        previewFixture = ProcessInfo.processInfo.arguments.contains {
+            $0 == "-store-preview" || $0 == "-computer-switcher-preview"
+        }
+#else
+        previewFixture = false
+#endif
         Self.removeStaleFilePreviews()
         _ = NotificationCoordinator.shared
         NotificationCoordinator.shared.responseHandler = { [weak self] target in
@@ -362,11 +375,47 @@ final class Session: ObservableObject {
             return
         }
 #endif
+        guard restoringSavedConnection else { return }
         restore()
         Task { await refreshNotificationAuthorization() }
     }
 
 #if DEBUG
+    /// A paired-looking session for Xcode's canvas.
+    ///
+    /// The canvas does not run the scheme's launch arguments, so the fixture
+    /// branch in `init` above is unreachable there. This hydrates the same
+    /// bundled JSON fleet directly, which is what makes `ChatListView` and
+    /// `ChatView` show something instead of an empty, unpaired app.
+    static func preview(fixture: String = "StorePreview") -> Session {
+        let session = Session(restoringSavedConnection: false)
+        let preview = Connection(
+            id: "preview-current",
+            name: "Preview Mac",
+            host: "preview.tailnet.ts.net",
+            port: 8810
+        )
+        session.connection = preview
+        session.connections = [preview]
+        session.status = .live
+
+        if let url = Bundle.main.url(forResource: fixture, withExtension: "json"),
+           let data = try? Data(contentsOf: url),
+           let fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
+            session.state.hydrate(fleet)
+        }
+        // ThreadPreview's other conversations live in a second fixture; the
+        // in-app preview path merges them too.
+        if let url = Bundle.main.url(forResource: "ThreadPreviewPages", withExtension: "json"),
+           let data = try? Data(contentsOf: url),
+           let pages = try? JSONDecoder().decode([String: ThreadPage].self, from: data) {
+            for (threadId, page) in pages {
+                session.state.merge(page, intoThread: threadId)
+            }
+        }
+        return session
+    }
+
     /// The preview fixtures' turn switch: flips one thread busy or idle with
     /// the same metadata-only bot frame the computer sends.
     func setPreviewTurn(busy: Bool, threadId: String) {
@@ -882,6 +931,8 @@ final class Session: ObservableObject {
 
     /// Called when the app comes to the front, and once at launch.
     func connect() {
+        // Previews have a hydrated fleet and no computer to stream from.
+        guard !previewFixture else { return }
         // A restore that found the keychain locked left `client` nil on
         // purpose. Coming to the front is the moment worth retrying on: the
         // app is on screen, so the phone is in someone's hand and unlocked.
@@ -2185,6 +2236,27 @@ final class Session: ObservableObject {
     }
 
     @discardableResult
+    func setBotPinned(_ bot: Bot, pinned: Bool) async -> Bool {
+        setBotPinnedLocally(bot, pinned: pinned)
+        guard let client else { return true }
+        do {
+            try await client.setBotPinned(botId: bot.id, pinned: pinned)
+            await refresh()
+            return true
+        } catch {
+            setBotPinnedLocally(bot, pinned: !pinned)
+            actionError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func setBotPinnedLocally(_ bot: Bot, pinned: Bool) {
+        guard var updated = state.bot(bot.id) else { return }
+        updated.pinned = pinned ? true : nil
+        state.apply(.bot(updated))
+    }
+
+    @discardableResult
     func setTaskPinned(_ task: BotTask, pinned: Bool, in chat: Chat) async -> Bool {
         guard let client else { return false }
         setPinnedLocally(task, pinned: pinned, in: chat)
@@ -2260,6 +2332,19 @@ final class Session: ObservableObject {
             state.apply(.bot(updated))
             return updated
         } catch { actionError = error.localizedDescription; return nil }
+    }
+
+    @discardableResult
+    func deleteBot(_ bot: Bot) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.deleteBot(botId: bot.id)
+            state.apply(.botDeleted(botId: bot.id))
+            return true
+        } catch {
+            actionError = error.localizedDescription
+            return false
+        }
     }
 
     @discardableResult

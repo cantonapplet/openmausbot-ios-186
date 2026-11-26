@@ -15,7 +15,7 @@ final class SwipeBackUITests: XCTestCase {
         // The roster's thread toggle only exists on Home, so this is the
         // proof the swipe performed a pop rather than a sideways scroll.
         XCTAssertTrue(
-            app.buttons["threads-toggle.preview-pepper"].waitForExistence(timeout: 10),
+            app.buttons["chat-row.preview-pepper"].waitForExistence(timeout: 10),
             "an edge swipe on a conversation should pop back to Home"
         )
         recordScreenshot("Home after edge swipe", in: app)
@@ -33,7 +33,7 @@ final class SwipeBackUITests: XCTestCase {
         center.press(forDuration: 0.05, thenDragTo: right)
 
         assertOnThread("Triage Gmail", in: app)
-        assertGone(app.buttons["threads-toggle.preview-pepper"], in: app)
+        assertGone(app.buttons["chat-row.preview-pepper"], in: app)
 
         // Vertical scrolling in the transcript keeps working.
         app.swipeUp()
@@ -52,12 +52,12 @@ final class SwipeBackUITests: XCTestCase {
         // root guard is proven by cycling, not by dragging across Home.)
         openConversation(in: app)
         edgeSwipeUntilPopped(in: app)
-        XCTAssertTrue(app.buttons["threads-toggle.preview-pepper"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["chat-row.preview-pepper"].waitForExistence(timeout: 10))
 
         openConversation(in: app)
         edgeSwipeUntilPopped(in: app)
         XCTAssertTrue(
-            app.buttons["threads-toggle.preview-pepper"].waitForExistence(timeout: 10),
+            app.buttons["chat-row.preview-pepper"].waitForExistence(timeout: 10),
             "the second swipe pop should land on Home exactly like the first"
         )
         recordScreenshot("Home after two back-to-back swipe pops", in: app)
@@ -75,7 +75,7 @@ final class SwipeBackUITests: XCTestCase {
     /// the caller's assertion still goes red.
     @MainActor
     private func edgeSwipeUntilPopped(in app: XCUIApplication) {
-        let header = app.buttons["header-threads"]
+        let header = app.buttons["header-bot-actions"]
         for _ in 0..<2 {
             edgeSwipe(in: app)
             if !header.waitForExistence(timeout: 3) { return }
@@ -99,12 +99,8 @@ final class SwipeBackUITests: XCTestCase {
         app.launchArguments = [
             "-store-preview", "-threads-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES",
-            // Home starts from the install default (compact), whatever an
-            // earlier run saved; Pepper's threads open from its "› 3".
-            "-reset-list-density"
         ]
         app.launch()
         // Simulator installation can restore an unpaired, prewarmed scene
@@ -113,32 +109,24 @@ final class SwipeBackUITests: XCTestCase {
             app.terminate()
             app.launch()
         }
-        XCTAssertTrue(app.buttons["threads-toggle.preview-pepper"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["chat-row.preview-pepper"].waitForExistence(timeout: 10))
         return app
     }
 
     @MainActor
     private func openConversation(in app: XCUIApplication) {
-        // On a fresh launch the bot row is collapsed, so expand it first.
-        // After a swipe pop the roster still carries that expanded state —
-        // tapping the toggle again would collapse it — and the bot row
-        // itself reopens the remembered thread, the same route
-        // ThreadNavigationUITests takes after tapping Back.
-        let gmail = app.buttons["thread.preview-gmail"]
-        if gmail.waitForExistence(timeout: 2) {
-            gmail.tap()
-        } else {
-            let toggle = app.buttons["threads-toggle.preview-pepper"]
-            toggle.tap()
-            XCTAssertTrue(gmail.waitForExistence(timeout: 5))
-            gmail.tap()
-        }
+        let row = app.buttons["chat-row.preview-pepper"]
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.press(forDuration: 0.6)
+        let gmail = app.buttons["Triage Gmail"].firstMatch
+        XCTAssertTrue(gmail.waitForExistence(timeout: 5))
+        gmail.tap()
         assertOnThread("Triage Gmail", in: app)
     }
 
     @MainActor
     private func assertOnThread(_ title: String, in app: XCUIApplication) {
-        let header = app.buttons["header-threads"]
+        let header = app.buttons["header-bot-actions"]
         let expected = NSPredicate(format: "value == %@", title)
         let appeared = XCTNSPredicateExpectation(predicate: expected, object: header)
         // Thread headers settle late on a loaded CI runner, matching the

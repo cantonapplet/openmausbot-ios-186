@@ -71,7 +71,6 @@ final class QuestionCardUITests: XCTestCase {
         app.launchArguments = [
             "-store-preview", "-question-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.prefs.rosterDensity", "comfortable",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES"
@@ -90,8 +89,15 @@ final class QuestionCardUITests: XCTestCase {
         if !input.exists || input.placeholderValue != "Answer \(bot)…" {
             let row = app.buttons["chat-row.preview-\(bot.lowercased())"].firstMatch
             XCTAssertTrue(row.waitForExistence(timeout: 10), "\(bot) on the roster")
-            // A waiting question raises the island over the top of the
-            // roster for its first seconds; the bottom of the row stays clear.
+            // The needs-you island covers the roster until it is put away,
+            // and its caption swallows a tap meant for the row beneath.
+            let needsYou = app.staticTexts
+                .matching(NSPredicate(format: "label CONTAINS %@", "needs you"))
+                .firstMatch
+            if needsYou.exists {
+                app.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.3)).tap()
+                _ = needsYou.waitForNonExistence(timeout: 3)
+            }
             for _ in 0..<3 where !input.exists {
                 row.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.88)).tap()
                 _ = input.waitForExistence(timeout: 3)

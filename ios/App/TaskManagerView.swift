@@ -89,7 +89,7 @@ struct TaskManagerView: View {
                         .font(.subheadline)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding()
-                        .background(.regularMaterial)
+                        .chromeBar()
                         .accessibilityElement(children: .combine)
                         .accessibilityIdentifier("thread-action-error")
                 }
@@ -98,8 +98,8 @@ struct TaskManagerView: View {
             .navigationTitle("\(current.name)’s threads")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }.disabled(isMutating)
+                ToolbarItem(placement: .topBarLeading) {
+                    CloseButton().disabled(isMutating)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     if isSelecting {
@@ -136,7 +136,7 @@ struct TaskManagerView: View {
                 if isMutating {
                     ProgressView("Updating threads…")
                         .padding(12)
-                        .background(.regularMaterial, in: Capsule())
+                        .glassCapsule(interactive: false)
                         .padding()
                 }
             }
@@ -206,7 +206,7 @@ struct TaskManagerView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
-        .background(.regularMaterial)
+        .chromeBar()
     }
 
     @ViewBuilder private func threadSections(current: Chat, tasks: [BotTask]) -> some View {

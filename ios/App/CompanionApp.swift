@@ -21,6 +21,7 @@ struct CompanionApp: App {
     @State private var liveActivities = LiveActivityBridge()
     @State private var widgetSync = WidgetSyncBridge.makeAppGroupBridge()
     @AppStorage(PrefKey.language) private var language = AppLanguage.system.rawValue
+    @AppStorage(PrefKey.appearance) private var appearance = AppAppearance.system.rawValue
 
     var body: some Scene {
         WindowGroup {
@@ -37,6 +38,10 @@ struct CompanionApp: App {
                 // leaving it on the phone's own locale, which is what an app
                 // with no language setting would use anyway.
                 .environment(\.locale, AppLanguage.resolved(language).locale ?? .autoupdatingCurrent)
+                // System / Light / Dark, chosen in Settings. Nil follows the
+                // phone, which is what the app did before the setting existed.
+                .preferredColorScheme(AppAppearance(stored: appearance).colorScheme)
+                .background(WindowAppearanceBridge(style: AppAppearance(stored: appearance).interfaceStyle))
                 // A navigation title is drawn by UIKit, which reads its string
                 // once and does not re-read it when the environment changes —
                 // so the body would switch language while the title above it
@@ -62,6 +67,9 @@ struct CompanionApp: App {
                     if LiveCallLifecycle.endsCall(on: phase.liveCallPhase) { liveCall.leaveForeground() }
                     switch phase {
                     case .active:
+                        // Anything delivered while away is cleared the
+                        // moment the app is on screen.
+                        NotificationCoordinator.shared.clearDelivered()
                         OpenMausSharedInbox.removeDirectories(olderThan: 60 * 60)
                         session.connect()
                         Task { await session.refreshNotificationAuthorization() }

@@ -8,9 +8,9 @@ struct SettingsView: View {
     @EnvironmentObject private var session: Session
     @State private var enablingNotifications = false
     @AppStorage(PrefKey.activityDetail) private var activityDetail = ActivityDetail.phoneDefault.rawValue
-    @AppStorage(PrefKey.islandIntro) private var islandIntro = IslandIntro.oncePerBot.rawValue
     @AppStorage(PrefKey.language) private var language = AppLanguage.system.rawValue
-    @AppStorage(PrefKey.rosterDensity) private var rosterDensity = RosterDensity.default.rawValue
+    @AppStorage(PrefKey.appearance) private var appearance = AppAppearance.system.rawValue
+    @AppStorage(PrefKey.updatesPill) private var updatesPill = false
     private let onConnect: (() -> Void)?
 
     init(onConnect: (() -> Void)? = nil) {
@@ -19,161 +19,191 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("Computer") {
-                if let connection = session.connection {
-                    NavigationLink {
-                        ConnectedComputersView()
-                    } label: {
-                        ComputerSettingsRow(
-                            name: Text(verbatim: connection.name),
-                            status: computerStatusText,
-                            connected: session.status == .live
-                        )
-                    }
-                } else {
-                    Button {
-                        onConnect?()
-                    } label: {
-                        ComputerSettingsRow(
-                            name: Text("Connect a computer"),
-                            status: Text("Not connected"),
-                            connected: false
-                        )
-                    }
-                    .disabled(onConnect == nil)
-                }
-            }
-
             Section {
-                if notificationsAreEnabled {
-                    notificationRow
-                        .accessibilityHint(notificationAccessibilityHint)
-                } else {
-                    Button {
-                        enablingNotifications = true
-                        Task {
-                            await session.enableNotifications()
-                            enablingNotifications = false
+                connectionHero
+                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 0, trailing: 16))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+            Section {
+                    Picker(selection: Binding(
+                        get: { AppAppearance(stored: appearance) },
+                        set: { appearance = $0.rawValue }
+                    )) {
+                        ForEach(AppAppearance.allCases) { option in
+                            Text(option.label).tag(option)
                         }
                     } label: {
-                        notificationRow
+                        Text("Theme")
                     }
-                    .disabled(enablingNotifications)
-                    .accessibilityHint(notificationAccessibilityHint)
-                }
-            } footer: {
-                Text("Alerts arrive while OpenMausBot is open or was recently in the background. Closed-app delivery is not available yet.")
-            }
+                    .accessibilityIdentifier("appearance")
 
-            Section {
-                Picker(selection: $activityDetail) {
-                    ForEach(ActivityDetail.allCases, id: \.rawValue) { level in
-                        Text(LocalizedStringKey(level.label)).tag(level.rawValue)
-                    }
-                } label: {
-                    Label {
-                        Text("Activity")
-                    } icon: {
-                        SettingsIcon(symbol: "wrench.and.screwdriver.fill", color: .purple)
-                    }
+                } header: {
+                    Text("Appearance")
                 }
 
-                Picker(selection: $islandIntro) {
-                    ForEach(IslandIntro.allCases, id: \.rawValue) { option in
-                        Text(LocalizedStringKey(option.label)).tag(option.rawValue)
-                    }
-                } label: {
-                    Label {
-                        Text("Bot intro animation")
-                    } icon: {
-                        SettingsIcon(symbol: "sparkles", color: .pink)
-                    }
-                }
-
-                NavigationLink {
-                    QuickRepliesEditor()
-                } label: {
-                    Label {
-                        Text("Quick Replies")
-                    } icon: {
-                        SettingsIcon(symbol: "bolt.fill", color: .yellow)
-                    }
-                }
-            } header: {
-                Text("Chat")
-            } footer: {
-                Text(LocalizedStringKey(ActivityDetail(rawValue: activityDetail)?.caption ?? ""))
-            }
-
-            Section {
-                // Bound through the resolved value, so a stored value this
-                // build cannot read still shows the density actually in use.
-                Picker(selection: Binding(
-                    get: { RosterDensity(stored: rosterDensity) },
-                    set: { rosterDensity = $0.rawValue }
-                )) {
-                    ForEach(RosterDensity.allCases, id: \.self) { density in
-                        Text(LocalizedStringKey(density.label)).tag(density)
-                    }
-                } label: {
-                    Label {
-                        Text("List density")
-                    } icon: {
-                        SettingsIcon(symbol: "list.bullet", color: .indigo)
-                    }
-                }
-                .accessibilityIdentifier("list-density")
-            } footer: {
-                Text(LocalizedStringKey(RosterDensity(stored: rosterDensity).caption))
-            }
-
-            Section {
-                Picker(selection: $language) {
-                    ForEach(AppLanguage.allCases) { option in
-                        Text(option.label).tag(option.rawValue)
-                    }
-                } label: {
-                    Label {
+                Section {
+                    Picker(selection: $language) {
+                        ForEach(AppLanguage.allCases) { option in
+                            Text(option.label).tag(option.rawValue)
+                        }
+                    } label: {
                         Text("Language")
-                    } icon: {
-                        SettingsIcon(symbol: "globe", color: .teal)
                     }
+                } header: {
+                    Text("Language")
+                } footer: {
+                    Text("Changes the language inside OpenMausMobile. Buttons drawn by iOS itself follow the phone's language, which you can set for this app in iOS Settings.")
                 }
-            } footer: {
-                Text("Changes the language inside OpenMausMobile. Buttons drawn by iOS itself follow the phone's language, which you can set for this app in iOS Settings.")
-            }
 
-            if session.connection != nil {
-                Section("Workspace") {
-                    NavigationLink {
-                        TasksRoutinesView()
-                    } label: {
-                        Label {
-                            Text("Threads & Routines")
-                        } icon: {
-                            SettingsIcon(symbol: "calendar.badge.clock", color: .orange)
+                Section {
+                    Picker(selection: $activityDetail) {
+                        ForEach(ActivityDetail.allCases, id: \.rawValue) { level in
+                            Text(LocalizedStringKey(level.label)).tag(level.rawValue)
                         }
+                    } label: {
+                        Text("Activity")
                     }
+                } header: {
+                    Text("Chat")
+                } footer: {
+                    Text(LocalizedStringKey(ActivityDetail(rawValue: activityDetail)?.caption ?? ""))
+                }
 
-                    // Connecting apps needs the admin scope; a chat-only
-                    // server session leaves it to the owner, in the server's UI.
-                    if session.canAdminister {
-                        NavigationLink {
-                            ConnectedAppsView()
+                Section {
+                    Toggle("Updates pill", isOn: $updatesPill)
+                } header: {
+                    Text("Home")
+                } footer: {
+                    Text("Shows the live status pill at the bottom of Home.")
+                }
+
+                Section {
+                    if notificationsAreEnabled {
+                        notificationRow
+                            .accessibilityHint(notificationAccessibilityHint)
+                    } else {
+                        Button {
+                            enablingNotifications = true
+                            Task {
+                                await session.enableNotifications()
+                                enablingNotifications = false
+                            }
                         } label: {
-                            Label {
+                            notificationRow
+                        }
+                        .disabled(enablingNotifications)
+                        .accessibilityHint(notificationAccessibilityHint)
+                    }
+                } header: {
+                    Text("Alerts")
+                } footer: {
+                    Text("Alerts arrive while OpenMausBot is open or was recently in the background. Closed-app delivery is not available yet.")
+                }
+
+                if session.connection != nil {
+                    Section("Workspace") {
+                        NavigationLink {
+                            TasksRoutinesView()
+                        } label: {
+                            Text("Threads & Routines")
+                        }
+
+                        // Connecting apps needs the admin scope; a chat-only
+                        // server session leaves it to the owner, in the server's UI.
+                        if session.canAdminister {
+                            NavigationLink {
+                                ConnectedAppsView()
+                            } label: {
                                 Text("Connected Apps")
-                            } icon: {
-                                SettingsIcon(symbol: "link", color: .blue)
                             }
                         }
                     }
                 }
             }
-        }
+        .scrollContentBackground(.hidden)
+        .compactSettingsSpacing()
+        .background(Color.appGroupedBackground)
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+        // A full-screen cover keeps the environment it was presented with,
+        // so the root's preferred scheme alone leaves this page on its old
+        // look. The picker's own value re-renders it here, live.
+        .preferredColorScheme(AppAppearance(stored: appearance).colorScheme)
         .task { await session.refreshNotificationAuthorization() }
+    }
+
+    @ViewBuilder
+    private var connectionHero: some View {
+        if let connection = session.connection {
+            NavigationLink {
+                ConnectedComputersView()
+            } label: {
+                sessionHero(
+                    name: Text(verbatim: connection.name),
+                    status: computerStatusText,
+                    connected: session.status == .live,
+                    action: "Manage"
+                )
+            }
+            .buttonStyle(.plain)
+        } else {
+            Button {
+                onConnect?()
+            } label: {
+                sessionHero(
+                    name: Text("Connect a computer"),
+                    status: Text("Not connected"),
+                    connected: false,
+                    action: "Connect"
+                )
+            }
+            .buttonStyle(.plain)
+            .disabled(onConnect == nil)
+        }
+    }
+
+    private func sessionHero(
+        name: Text, status: Text, connected: Bool, action: LocalizedStringKey
+    ) -> some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                    )
+                    .frame(width: 44, height: 44)
+                Image(systemName: "laptopcomputer")
+                    .font(.system(size: 19, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.85))
+            }
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                name
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(connected ? Color.green : Color.secondary)
+                        .frame(width: 7, height: 7)
+                    status
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            Text(action)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 
     private var notificationsAreEnabled: Bool {
@@ -191,7 +221,6 @@ struct SettingsView: View {
 
     private var notificationRow: some View {
         HStack(spacing: 12) {
-            SettingsIcon(symbol: "bell.fill", color: .red)
             Text("Notifications")
                 .foregroundStyle(.primary)
             Spacer()
@@ -220,14 +249,11 @@ private struct ComputerSettingsRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(MausPalette.color("blue").opacity(0.14))
-                    .frame(width: 38, height: 38)
-                Image(systemName: "laptopcomputer")
-                    .foregroundStyle(MausPalette.color("blue"))
-            }
-            .accessibilityHidden(true)
+            Image(systemName: "laptopcomputer")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(Color.primary.opacity(0.85))
+                .frame(width: 38, height: 38)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 3) {
                 name
@@ -249,19 +275,6 @@ private struct ComputerSettingsRow: View {
     }
 }
 
-private struct SettingsIcon: View {
-    let symbol: String
-    let color: Color
-
-    var body: some View {
-        Image(systemName: symbol)
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 28, height: 28)
-            .background(color, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .accessibilityHidden(true)
-    }
-}
 
 struct ConnectedComputersView: View {
     @EnvironmentObject private var session: Session
@@ -315,7 +328,7 @@ struct ConnectedComputersView: View {
                                 Spacer()
                                 Text("Use")
                                     .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(MausPalette.color("blue"))
+                                    .foregroundStyle(Color.primary.opacity(0.85))
                             }
                             .contentShape(Rectangle())
                         }
@@ -335,12 +348,14 @@ struct ConnectedComputersView: View {
                     Haptics.selection()
                     session.beginPairing()
                 } label: {
-                    Label("Connect another computer", systemImage: "plus.circle.fill")
+                    Text("Connect another computer")
                 }
             } footer: {
                 Text("Each computer is paired separately. Only the selected computer is active at a time.")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(Color.appGroupedBackground)
         .navigationTitle("Computers")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog(
@@ -467,6 +482,8 @@ struct ConnectionSecurityView: View {
                 EmptyStateView("No computer connected", systemImage: "laptopcomputer.slash")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(Color.appGroupedBackground)
         .navigationTitle("Connection & Security")
         .navigationBarTitleDisplayMode(.inline)
         .alert("Edit address", isPresented: $editingAddress) {
@@ -529,6 +546,20 @@ private extension Session.Status {
         case .unpaired: return Text("Not paired")
         case .unauthorized: return Text("Needs pairing")
         case .offline: return Text("Offline")
+        }
+    }
+}
+
+private extension View {
+    /// Tighter section gaps and a trimmed top margin on iOS 17+, matching
+    /// the Bot settings form. iOS 16 keeps the system spacing.
+    @ViewBuilder
+    func compactSettingsSpacing() -> some View {
+        if #available(iOS 17.0, *) {
+            listSectionSpacing(.compact)
+                .contentMargins(.top, 4, for: .scrollContent)
+        } else {
+            self
         }
     }
 }

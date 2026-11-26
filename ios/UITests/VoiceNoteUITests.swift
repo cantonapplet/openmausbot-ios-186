@@ -7,14 +7,23 @@ final class VoiceNoteUITests: XCTestCase {
         app.terminate()
         app.launchArguments = ["-store-preview", "-threads-preview", "-voice-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES"]
         app.launch()
-        let toggle = app.buttons["threads-toggle.preview-pepper"]
-        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
-        toggle.tap()
-        app.buttons["thread.preview-gmail"].tap()
+        let pepper = app.buttons["chat-row.preview-pepper"]
+        XCTAssertTrue(pepper.waitForExistence(timeout: 10))
+        pepper.tap()
+        let header = app.buttons["header-bot-actions"]
+        XCTAssertTrue(header.waitForExistence(timeout: 10))
+        let onGmail = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "Triage Gmail"), object: header
+        )
+        if XCTWaiter.wait(for: [onGmail], timeout: 3) != .completed {
+            app.openThreadsFromHeader()
+            let gmail = app.buttons["thread-preview-gmail"]
+            XCTAssertTrue(gmail.waitForExistence(timeout: 5))
+            gmail.tap()
+        }
 
         let time = app.staticTexts["voice-note-time"]
         XCTAssertTrue(scrollTo(time, app: app), "voice note clock never appeared")

@@ -37,6 +37,10 @@ struct ChatView: View {
     @State private var revealedMessageId: String?
     /// The reader has dragged this thread's transcript since it opened.
     @State private var readerScrolled = false
+    /// The opening scroll has landed on this thread's end. Until it has, a
+    /// scroll-phase callback (which can arrive during the push animation)
+    /// must not be mistaken for the reader leaving the end.
+    @State private var hasLandedOnEnd = false
     /// The reader scrolled the transcript themselves and has not come back to
     /// its end: nothing scrolls it for them meanwhile. Known from the scroll
     /// phase (iOS 18); below that, only from the end being out of view.
@@ -45,11 +49,12 @@ struct ChatView: View {
     /// frame updates it without redrawing the screen.
     @State private var scrollReading = ScrollReading()
     @State private var showingTasks = false
-    @State private var showingComputer = false
-    @State private var showingPlus = false
+    @AppStorage(PrefKey.screenTarget) private var screenTargetRaw = ScreenTarget.browser.rawValue
+    @State private var screenCover: ScreenTarget?
     @State private var showingProfile = false
-    @State private var showCommandHUD = false
-    @State private var shareFile: ShareFile?
+    /// Set by the settings sheet when a chat action row is tapped; run once
+    /// the sheet has actually gone, so the next sheet or alert can present.
+    @State private var pendingProfileAction: AgentProfileAction?
     @State private var showingPhotoPicker = false
     @State private var showingFileImporter = false
     @State private var selectedPhotos: [PhotosPickerItem] = []
@@ -74,16 +79,12 @@ struct ChatView: View {
     @State private var disclosingLiveCall: Bot?
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = SpeechDictation()
-    /// The opening beat: the island grows with the bot's face in it, then
-    /// shrinks away as the face settles into the header. `facePhase` is 1
-    /// with the face in the island, 0 with it home in the header.
-    @State private var islandExpanded = false
-    @State private var islandVisible = false
-    @State private var facePhase: CGFloat = 0
     /// Reading scrollback: the end of the transcript is below the screen, so
     /// the Jump to latest pill is offered. Tracked from two edges rather than
     /// a scroll offset, because iOS 16 has no scroll-position API.
     @State private var viewportBottom: CGFloat = 0
+    /// The scroll view's own bottom, which on iOS 26 runs under the composer.
+    @State private var scrollBottom: CGFloat = 0
     @State private var showsJumpToLatest = false
     /// VoiceOver has heard "… is typing" for this turn.
     @State private var typingAnnounced = false
@@ -91,10 +92,7 @@ struct ChatView: View {
     /// reader had scrolled.
     @State private var sendJumps = 0
 
-    @AppStorage(PrefKey.islandIntro) private var islandIntro = IslandIntro.oncePerBot.rawValue
-    @AppStorage(PrefKey.islandSeen) private var islandSeen = ""
     @AppStorage(PrefKey.activityDetail) private var activityDetail = ActivityDetail.phoneDefault.rawValue
-    @AppStorage(PrefKey.quickReplies) private var quickReplies = ""
 
     init(chat: Chat) {
         self.chat = chat
@@ -138,16 +136,6 @@ struct ChatView: View {
         guard case let .bot(bot) = chat else { return false }
         guard let live = session.state.bot(bot.id) else { return true }
         return live.tasks.map { !$0.contains { $0.threadId == selectedThreadId } } ?? false
-    }
-
-    /// A task changes a bot's thread, but it does not make it a new bot.
-    /// Intro history follows the chat itself so switching tasks cannot replay
-    /// a once-per-bot greeting.
-    private var islandIntroID: String {
-        switch current {
-        case let .bot(bot): "bot.\(bot.id)"
-        case let .room(room): "room.\(room.id)"
-        }
     }
 
     private var messages: [Message] {
@@ -255,7 +243,6 @@ struct ChatView: View {
     }
 
     /// The composer's chip row, as edited in Settings.
-    private var storedChips: [ActionChipItem] { StoredChips.chips(quickReplies) }
 
     /// Unread elsewhere — what the back pill's badge counts, like Messages.
     private var unreadElsewhere: Int {
@@ -268,23 +255,9 @@ struct ChatView: View {
         // array as a unit; repeatedly reaching through ObservableObject for
         // every row only recomputes the same value.
         let snapshot = transcriptSnapshot
-        // A VStack with the composer as a sibling, rather than a scroll view
-        // with `.safeAreaInset`. The inset version sized itself to its
-        // content, so a short transcript left the composer floating in the
-        // middle of the screen with black beneath it. Here the scroll area is
-        // explicitly told to take everything the composer does not.
-        VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                transcriptScrollView(proxy: proxy, snapshot: snapshot)
-            }
-            .id(threadId)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            liveCallBars
-            composer(snapshot)
-        }
+        chatLayout(snapshot)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        .overlay(alignment: .bottom) { plusSheet }
+        .background(Color.appBackground.ignoresSafeArea())
         .overlay(alignment: .bottomTrailing) { busyFleetFixtureBadge }
         .toolbar(.hidden, for: .navigationBar)
         .navigationBarBackButtonHidden(true)
@@ -293,9 +266,6 @@ struct ChatView: View {
         // Re-arm it so a rightward swipe from the left edge pops back to
         // Home, the way the rest of iOS behaves.
         .background(SwipeBackBridge())
-        .navigationDestination(isPresented: $showingComputer) {
-            if case let .bot(bot) = current { ComputerView(bot: bot) }
-        }
         .task(id: threadId) { await enterThread() }
         .onValueChange(of: selectedThreadWasRemoved) { removed in
             if removed { dismiss() }
@@ -329,17 +299,19 @@ struct ChatView: View {
         .onValueChange(of: scenePhase) { phase in
             if phase != .active { dictation.stop() }
         }
-        .onValueChange(of: showingComputer) { shown in
-            if shown { dictation.stop() }
+        .onValueChange(of: screenCover) { target in
+            if target != nil { dictation.stop() }
         }
         .onValueChange(of: showingTasks) { shown in
             if shown { dictation.stop() }
         }
         .onValueChange(of: showingProfile) { shown in
-            if shown { dictation.stop() }
-        }
-        .onValueChange(of: showingPlus) { shown in
-            if shown { dictation.stop() }
+            if shown {
+                dictation.stop()
+            } else {
+                // The page popped: the action it chose, if any, runs now.
+                runPendingProfileAction()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { note in
             stopDictation(ifInterruptedBy: note)
@@ -357,11 +329,10 @@ struct ChatView: View {
                 TaskManagerView(chat: current) { selectedThreadId = $0 }
             }
         }
-        .sheet(isPresented: $showingProfile) {
-            if case let .bot(bot) = current { AgentProfileView(bot: bot) }
-        }
-        .sheet(item: $shareFile) { file in
-            ActivityShareSheet(items: [file.url])
+        // The bot's settings push like any other page; the stack's back
+        // button replaces the sheet's Done.
+        .navigationDestination(isPresented: $showingProfile) {
+            profilePage
         }
         .photosPicker(
             isPresented: $showingPhotoPicker,
@@ -380,6 +351,9 @@ struct ChatView: View {
             allowsMultipleSelection: true,
             onCompletion: importFiles
         )
+        .fullScreenCover(item: $screenCover) { target in
+            screenCoverView(target)
+        }
         .fullScreenCover(item: $filePreview) { preview in
             FilePreviewView(item: preview) {
                 filePreview = nil
@@ -405,6 +379,49 @@ struct ChatView: View {
         }
     }
 
+    /// The transcript and the composer. On iOS 26 the composer is a bottom
+    /// safe area bar, so the transcript keeps scrolling underneath it and
+    /// gets the same soft edge effect as Home's floating bar. Older systems
+    /// keep the plain stacked layout.
+    @ViewBuilder
+    private func chatLayout(_ snapshot: TranscriptSnapshot) -> some View {
+        if #available(iOS 26.0, *) {
+            ScrollViewReader { proxy in
+                transcriptScrollView(proxy: proxy, snapshot: snapshot)
+                    .id(threadId)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .softBottomScrollEdgeEffect()
+                    .safeAreaBar(edge: .bottom, spacing: 0) {
+                        composerArea(snapshot, proxy: proxy)
+                    }
+            }
+        } else {
+            ScrollViewReader { proxy in
+                VStack(spacing: 0) {
+                    transcriptScrollView(proxy: proxy, snapshot: snapshot)
+                        .id(threadId)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                    composerArea(snapshot, proxy: proxy)
+                }
+            }
+        }
+    }
+
+    /// The bar and the input, and where the transcript's visible bottom is.
+    /// Measuring the composer's top (rather than the scroll view's frame,
+    /// which now runs under it) keeps the end readings and Jump to latest
+    /// pill exact.
+    private func composerArea(_ snapshot: TranscriptSnapshot, proxy: ScrollViewProxy) -> some View {
+        VStack(spacing: 0) {
+            liveCallBars
+            composer(snapshot)
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: { top in
+            viewportBottom = top
+        }
+    }
+
     // MARK: - Transcript
 
     /// The transcript: its rows, the live tail, the header and face that
@@ -414,6 +431,25 @@ struct ChatView: View {
         let actions = transcriptActions(proxy)
         return ScrollView {
             transcriptColumn(proxy: proxy, snapshot: snapshot, actions: actions)
+            // After the column's bottom padding, so landing on the end id
+            // lands on the true content bottom: no leftover scrollable gap
+            // under the newest message when a chat opens.
+            transcriptEnd
+        }
+        // iOS 26's scroll edge effect: content fades and blurs under the
+        // header the way a system bar does, instead of running into a
+        // hard band of colour. `.automatic` is the platform's own choice
+        // for a bar, a touch stronger than the roster's soft blend.
+        .automaticTopScrollEdgeEffect()
+        // The scroll view now runs under the composer on iOS 26. Measure its
+        // frame and lift Jump to latest by however far the composer covers,
+        // so the pill floats just above the bar and stays tappable.
+        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { bottom in
+            scrollBottom = bottom
+        }
+        .overlay(alignment: .bottom) {
+            jumpToLatestPill(proxy)
+                .padding(.bottom, max(0, scrollBottom - viewportBottom + 10))
         }
         // The header lives in the scroll view's top safe area: the
         // transcript starts below it and scrolls under it — that is
@@ -424,15 +460,6 @@ struct ChatView: View {
         // a system bar is; the transcript starts on that line and
         // scrolls under the face and name, which float over it.
         .safeAreaInset(edge: .top, spacing: 0) { headerBar }
-        .overlay(alignment: .top) { headerFace }
-        .overlay(alignment: .top) { floatingFace }
-        // Reading scrollback — one tap back to the end, streaming or
-        // not, the same pill the desktop chat offers.
-        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { bottom in
-            viewportBottom = bottom
-        }
-        .overlay(alignment: .bottom) { jumpToLatestPill(proxy) }
-        .task { await playIslandIntro() }
         // A conversation grows from the bottom: a transcript shorter
         // than the screen rests at the bottom, and opening a chat
         // starts on the newest message rather than the oldest.
@@ -514,11 +541,11 @@ struct ChatView: View {
             ForEach(Array(transcript.enumerated()), id: \.element.id) { index, row in
                 rowView(row, at: index, in: transcript, shared: shared)
                     .equatable()
+                    .padding(.top, roleGap(at: index, in: transcript))
                     .id(row.id)
             }
 
             liveTail(snapshot)
-            transcriptEnd
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -600,7 +627,6 @@ struct ChatView: View {
             row: row,
             stamp: startsANewStretch(at: index, in: transcript) ? row.head.date : nil,
             today: shared.today,
-            endsRun: endsRun(at: index, in: transcript),
             versions: versions,
             isPendingEdit: shared.pendingEditId == row.id,
             routineRun: routineRun,
@@ -700,32 +726,6 @@ struct ChatView: View {
         }
     }
 
-    /// One face, in one layer, measured from the screen's top
-    /// edge: it sits in the island while that is open and
-    /// glides into its header slot when the island lets go.
-    private var floatingFace: some View {
-        let topInset = IslandGeometry.topInset
-        let islandSide: CGFloat = 220
-        // centred in the part of the square the hardware island does not cover
-        let islandFaceCentre = IslandGeometry.top + IslandGeometry.size.height + (islandSide - IslandGeometry.size.height) / 2
-        let headerFaceCentre = topInset + 26
-        let faceSize = 60 + 72 * facePhase
-        let faceCentre = headerFaceCentre + (islandFaceCentre - headerFaceCentre) * facePhase
-        return ZStack(alignment: .top) {
-            if islandVisible {
-                IslandShell(expanded: islandExpanded, expandedSize: CGSize(width: islandSide, height: islandSide)) {
-                    Color.clear
-                }
-            }
-            ChatAvatarView(chat: current, size: faceSize, state: MausState.forChat(current, in: session.state), animated: MausState.forChat(current, in: session.state).showsActivity || islandExpanded, comets: islandExpanded)
-                .offset(y: faceCentre - faceSize / 2)
-                .allowsHitTesting(false)
-        }
-        .frame(maxWidth: .infinity, alignment: .top)
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
-    }
-
     @ViewBuilder private func jumpToLatestPill(_ proxy: ScrollViewProxy) -> some View {
         if showsJumpToLatest {
             Button {
@@ -736,46 +736,48 @@ struct ChatView: View {
                     .font(.footnote.weight(.medium))
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
-                    .background(.regularMaterial, in: Capsule())
-                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08)))
+                    .glassCapsule(interactive: false)
                     .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Jump to latest messages")
-            .padding(.bottom, 10)
             .transition(.opacity.combined(with: .scale(scale: 0.9)))
         }
     }
 
-    /// grow, hold a beat, shrink — the face rides along
-    private func playIslandIntro() async {
-        guard CompanionLayout.supportsIslandPresentation, !reduceMotion else { return }
-        // The intro is a greeting, and a greeting repeated every
-        // time you open a chat stops being one.
-        let intro = IslandIntro(rawValue: islandIntro) ?? .oncePerBot
-        switch intro {
-        case .never:
-            return
-        case .oncePerBot:
-            guard !IslandSeen.contains(islandIntroID, in: islandSeen) else { return }
-            islandSeen = IslandSeen.adding(islandIntroID, to: islandSeen)
-        case .always:
-            break
-        }
-        islandVisible = true
-        try? await Task.sleep(for: .milliseconds(40))
-        withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) { islandExpanded = true; facePhase = 1 }
-        try? await Task.sleep(for: .milliseconds(1000))
-        withAnimation(.spring(response: 0.55, dampingFraction: 0.82)) { islandExpanded = false; facePhase = 0 }
-        try? await Task.sleep(for: .milliseconds(600))
-        islandVisible = false
-    }
-
     /// One more scroll to the end once the first layout has settled, unless
     /// the reader has already scrolled away.
+    ///
+    /// Opening from Home must always land on the newest message: the first
+    /// pass can run before the header inset and composer have sized the
+    /// viewport, so it is repeated after that layout settles. Only a real
+    /// drag after the landing may keep the transcript away from its end.
     private func settleOnEnd(_ proxy: ScrollViewProxy) async {
+        // A search hit is what the chat should open on; the end is not the
+        // target then. `revealedMessageId` covers the same race from the
+        // other side: the reveal may already have consumed the focus.
+        guard session.focusedMessageId == nil, revealedMessageId == nil, !rows.isEmpty else { return }
+
+        if !hasLandedOnEnd {
+            readerScrolled = false
+            readerDetached = false
+            // Opening from Home pushes this view in while the header, the
+            // composer and the transcript's own first layout settle at
+            // different moments. Land again as each one does, so the chat
+            // opens on the very end rather than a frame short of it.
+            for gap in [50, 50, 150, 250] {
+                try? await Task.sleep(for: .milliseconds(gap))
+                guard !Task.isCancelled, !readerScrolled,
+                      session.focusedMessageId == nil, revealedMessageId == nil else { return }
+                proxy.scrollTo(Self.transcriptEndId, anchor: .bottom)
+            }
+            readerDetached = false
+            hasLandedOnEnd = true
+            return
+        }
+
         try? await Task.sleep(for: .milliseconds(50))
-        guard !Task.isCancelled, !readerScrolled, !rows.isEmpty else { return }
+        guard !Task.isCancelled, !readerScrolled else { return }
         proxy.scrollTo(Self.transcriptEndId, anchor: .bottom)
     }
 
@@ -794,6 +796,15 @@ struct ChatView: View {
         }
         proxy.scrollTo(folded?.id ?? messageId, anchor: .center)
         session.consumeFocus(messageId)
+        // The fold expands after this update, and the found reply can sit
+        // many screens inside it: waiting for that row's `onAppear` would
+        // never fire. Land on the reply once the taller layout exists.
+        Task { @MainActor in
+            for gap in [80, 160, 300] {
+                try? await Task.sleep(for: .milliseconds(gap))
+                proxy.scrollTo(messageId, anchor: .center)
+            }
+        }
     }
 
     // MARK: - Thread lifecycle
@@ -808,10 +819,10 @@ struct ChatView: View {
         if openedChat.unread { await session.markRead(openedChat) }
 #if DEBUG
         // `-open-plus`: the + sheet up, for the screenshot harness
-        if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
         // Profile parity screenshots without automating a tap through the
         // animated island/header transition.
         if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
+        if ProcessInfo.processInfo.arguments.contains("-open-computer") { screenCover = .computer }
         // `-chat-typing-preview`: the turn starts a beat after the chat
         // opens, so the typing bubble arrives with no new message to follow.
         if ProcessInfo.processInfo.arguments.contains("-chat-typing-preview"), !openedChat.busy {
@@ -844,11 +855,10 @@ struct ChatView: View {
         attachments = restored.attachments
         attachmentError = restored.error
         selectedPhotos = []
-        showCommandHUD = false
-        showingPlus = false
         readerScrolled = false
         // The next thread opens on its newest message; the pill comes back
         // once its own end is measured below the screen.
+        hasLandedOnEnd = false
         readerDetached = false
         showsJumpToLatest = false
         // A download started in the previous task must not open a sheet (or
@@ -935,91 +945,126 @@ struct ChatView: View {
 
     // MARK: - Header
 
-    /// Back on the left with the rest-of-app unread count, then the Live
-    /// call button; threads and the bot's computer on the right — a blurred
-    /// strip to the top edge.
+    /// Back and the bot or room's face and name, side by side on the left.
+    /// The title is the chat's action: settings for a bot, threads for a room
+    /// with more than one.
     private var headerBar: some View {
-        HStack(alignment: .top) {
+        HStack(alignment: .center, spacing: 8) {
             Button { dismiss() } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 17, weight: .semibold))
-                    if unreadElsewhere > 0 {
-                        Text("\(unreadElsewhere)")
-                            .font(.system(size: 13, weight: .semibold))
-                            .padding(.horizontal, 7)
-                            .frame(minWidth: 22, minHeight: 22)
-                            .background(Capsule().fill(Color.secondary.opacity(0.22)))
-                    }
-                }
-                .foregroundStyle(Color.primary)
-                .padding(.leading, 12)
-                .padding(.trailing, unreadElsewhere > 0 ? 8 : 12)
-                // At least as wide as it is tall: a circle alone, a pill
-                // once the unread count joins it.
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Capsule())
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .glassCapsule()
             .accessibilityLabel("Back")
+            .accessibilityValue(unreadElsewhere > 0 ? "\(unreadElsewhere) unread elsewhere" : "")
 
-            // Beside Back rather than the computer: the bot's face sits in
-            // the middle of this strip, and one more round button on the
-            // right pushes the Threads pill under it. Here, hiding it during
-            // a call moves nothing else.
-            if case let .bot(bot) = current, canStartLiveCall {
-                GlassButton(systemImage: "phone", size: 44, weight: .medium) {
-                    Haptics.selection()
-                    if LiveCallDisclosure().isDue {
-                        disclosingLiveCall = bot
-                    } else {
-                        startLiveCall(bot)
-                    }
-                }
-                .accessibilityLabel("Start a Live call with \(current.name)")
-                .accessibilityIdentifier("live-call-start")
-            }
+            Spacer(minLength: 8)
 
-            Spacer(minLength: 4)
+            headerTitle
 
-            HStack(spacing: 8) {
-                if current.supportsTasks {
-                    Button {
-                        showingTasks = true
-                    } label: {
-                        Label("Threads", systemImage: "square.stack")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(Color.primary)
-                            .padding(.horizontal, 12)
-                            .frame(height: 44)
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .glassCapsule()
-                    // The thread you are on, now that the pill under the
-                    // face that named it is gone.
-                    .accessibilityValue(Text(verbatim: current.threadTitle))
-                    .accessibilityIdentifier("header-threads")
-                }
-                if case .bot = current {
-                    GlassButton(systemImage: "display", size: 44, weight: .medium) {
-                        showingComputer = true
-                    }
-                    .accessibilityLabel("Watch \(current.name)'s computer")
-                } else {
-                    Color.clear.frame(width: 44, height: 44)
-                }
-            }
+            Spacer(minLength: 8)
+
+            screenButton
         }
         .padding(.horizontal, 16)
         .padding(.top, 4)
-        .padding(.bottom, 8)
+        .padding(.bottom, 12)
         .frame(maxWidth: CompanionLayout.headerWidth)
         .frame(maxWidth: .infinity)
-        .background(
+        .background(headerBarBackground)
+    }
+
+    private var screenTarget: ScreenTarget {
+        ScreenTarget(rawValue: screenTargetRaw) ?? .browser
+    }
+
+    /// The screen picked in Settings: a globe for the browser, a display for
+    /// the computer. The choice is per phone, so every bot shares it.
+    @ViewBuilder
+    private var screenButton: some View {
+        if case .bot = current {
+            Button {
+                dictation.stop()
+                screenCover = screenTarget
+            } label: {
+                Image(systemName: screenTarget.icon)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .glassCapsule()
+            .accessibilityLabel(screenTarget.title)
+        } else {
+            Color.clear.frame(width: 44, height: 44)
+        }
+    }
+
+    @ViewBuilder
+    private var headerTitle: some View {
+        if case .bot = current {
+            Button { showingProfile = true } label: {
+                headerTitleLabel
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open \(current.name) settings")
+            .accessibilityValue(Text(verbatim: current.threadTitle))
+            .accessibilityHint("Threads, computer, Live calls, and bot settings")
+            .accessibilityIdentifier("header-bot-actions")
+        } else if current.supportsTasks {
+            Menu {
+                Button { showingTasks = true } label: {
+                    Label("Threads", systemImage: "square.stack")
+                }
+            } label: {
+                headerTitleLabel
+            }
+            .accessibilityLabel("\(current.name) actions")
+            .accessibilityValue(Text(verbatim: current.threadTitle))
+            .accessibilityIdentifier("header-room-actions")
+        } else {
+            headerTitleLabel
+        }
+    }
+
+    private var headerTitleLabel: some View {
+        HStack(spacing: 8) {
+            ChatAvatarView(
+                chat: current,
+                size: 28,
+                state: MausState.forChat(current, in: session.state),
+                animated: false
+            )
+            Text(current.name)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Color.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.leading, 15)
+        .padding(.trailing, 13)
+        .padding(.vertical, 8)
+        // A small pill keeps the face and name readable over a bright bubble
+        // scrolling underneath, the same glass as the buttons beside it.
+        .contentShape(Capsule())
+        .glassCapsule()
+    }
+
+    /// On iOS 26 the scroll view's soft edge effect supplies the blur, so the
+    /// bar itself is clear. Earlier systems get the opaque page-coloured
+    /// strip with the same 20 pt fade.
+    @ViewBuilder
+    private var headerBarBackground: some View {
+        if #available(iOS 26.0, *) {
+            Color.clear
+        } else {
             Rectangle()
-                .fill(.ultraThinMaterial)
+                .fill(Color.appBackground)
                 .mask(
                     VStack(spacing: 0) {
                         Color.black
@@ -1030,182 +1075,89 @@ struct ChatView: View {
                 .padding(.bottom, -20)
                 .ignoresSafeArea(edges: .top)
                 .allowsHitTesting(false)
-        )
-    }
-
-    /// The seat for the bot's face, floating over the transcript between the
-    /// two buttons. The thread it is on is the Threads button's to say.
-    private var headerFace: some View {
-        // Always here, following the island's face while that one is
-        // the source: when the island lets go, this one flies home.
-        // The face itself is drawn by the island layer above so there is
-        // still only one animated avatar. This transparent seat becomes
-        // its independent profile button once the opening transition has
-        // settled.
-        Group {
-            if case .bot = current {
-                Button { showingProfile = true } label: {
-                    Color.clear
-                        .frame(width: 60, height: 60)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .allowsHitTesting(!islandVisible)
-                .accessibilityHidden(islandVisible)
-                .accessibilityLabel("Open \(current.name) settings")
-                .accessibilityHint("Changes this bot's model, profile, notifications, and voice")
-            } else if case let .room(room) = current {
-                // A room's face says whose room this is: the header has no
-                // other place for its name and members.
-                Color.clear
-                    .frame(width: 60, height: 60)
-                    .accessibilityElement()
-                    .accessibilityLabel("\(room.name), \(room.memberIds.count) bots")
-                    .accessibilityIdentifier("header-room")
-            }
         }
-        .padding(.top, -4)
     }
 
-    // MARK: - The + sheet
+    private func requestLiveCall(_ bot: Bot) {
+        Haptics.selection()
+        if LiveCallDisclosure().isDue {
+            disclosingLiveCall = bot
+        } else {
+            startLiveCall(bot)
+        }
+    }
 
-    /// What the composer's + opens: a glass sheet of the things you can do
-    /// here, each with a line saying what it does. Rises above the composer;
-    /// tapping anywhere else, or the × the + became, puts it away.
+    private func handleProfileAction(_ action: AgentProfileAction) {
+        pendingProfileAction = action
+        showingProfile = false
+    }
+
     @ViewBuilder
-    private var plusSheet: some View {
-        if showingPlus {
-            ZStack(alignment: .bottom) {
-                Color.black.opacity(0.35)
-                    .ignoresSafeArea()
-                    .onTapGesture { withAnimation(.snappy(duration: 0.28)) { showingPlus = false } }
+    private var profilePage: some View {
+        if case let .bot(bot) = current {
+            AgentProfileView(
+                bot: bot,
+                onAction: handleProfileAction,
+                canStartCall: canStartLiveCall
+            )
+        }
+    }
 
-                VStack(spacing: 0) {
-                    ForEach(plusActions) { action in
-                        Button {
-                            withAnimation(.snappy(duration: 0.28)) { showingPlus = false }
-                            action.run()
-                        } label: {
-                            HStack(spacing: 16) {
-                                Image(systemName: action.systemImage)
-                                    .font(.system(size: 20, weight: .medium))
-                                    .foregroundStyle(action.destructive ? Color.red : Color.primary)
-                                    .frame(width: 44, height: 44)
-                                    .background(Circle().fill(Color.primary.opacity(0.10)))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(action.title)
-                                        .font(.system(size: 19, weight: .medium))
-                                        .foregroundStyle(action.destructive ? Color.red : Color.primary)
-                                    Text(action.subtitle)
-                                        .font(.system(size: 13))
-                                        .foregroundStyle(Color.secondary)
-                                }
-                                Spacer(minLength: 0)
-                            }
-                            .padding(.horizontal, 18)
-                            .frame(height: 64)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(action.disabled)
-                        .opacity(action.disabled ? 0.45 : 1)
+    private func runPendingProfileAction() {
+        guard let action = pendingProfileAction else { return }
+        pendingProfileAction = nil
+        switch action {
+        case .threads:
+            showingTasks = true
+        case .computer:
+            screenCover = .computer
+        case .browser:
+            screenCover = .browser
+        case .liveCall:
+            if case let .bot(bot) = current { requestLiveCall(bot) }
+        }
+    }
+
+    @ViewBuilder
+    private func screenCoverView(_ target: ScreenTarget) -> some View {
+        NavigationStack {
+            Group {
+                switch target {
+                case .browser:
+                    if case let .bot(bot) = current, let client = session.browserLiveClient() {
+                        BrowserControlView(bot: bot, client: client)
+                    } else {
+                        unavailableScreen("Browser unavailable")
+                    }
+                case .computer:
+                    if case let .bot(bot) = current {
+                        ComputerView(bot: bot)
+                    } else {
+                        unavailableScreen("Computer unavailable")
                     }
                 }
-                .padding(.vertical, 10)
-                .frame(maxWidth: CompanionLayout.chatWidth, alignment: .leading)
-                .glassSheet(cornerRadius: 30)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 70)
-                .frame(maxWidth: .infinity)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            .transition(.opacity)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { CloseButton() }
+            }
         }
     }
 
-    private struct PlusAction: Identifiable {
-        let id: String
-        let systemImage: String
-        let title: LocalizedStringKey
-        let subtitle: LocalizedStringKey
-        var destructive = false
-        var disabled = false
-        let run: () -> Void
-    }
-
-    private var plusActions: [PlusAction] {
-        let canAddAttachment = attachments.count < AttachmentPolicy.maximumItems
-            && !preparingAttachments && !sendingMessage
-        var out: [PlusAction] = [
-            PlusAction(
-                id: "photos", systemImage: "photo.on.rectangle", title: "Photo Library",
-                subtitle: "Add a photo to this message", disabled: !canAddAttachment
-            ) { showingPhotoPicker = true },
-            PlusAction(
-                id: "files", systemImage: "paperclip", title: "Choose File",
-                subtitle: "Add a document from Files", disabled: !canAddAttachment
-            ) { showingFileImporter = true },
-        ]
-        if case let .bot(bot) = current {
-            out.append(PlusAction(
-                id: "task", systemImage: "plus.square.on.square", title: "New thread",
-                subtitle: "Start a fresh thread with \(bot.name)"
-            ) { Task {
-                if let created = await session.createTask(for: bot, title: nil) {
-                    selectedThreadId = created.threadId
-                }
-            } })
-            out.append(PlusAction(
-                id: "tasks", systemImage: "square.stack", title: "Threads",
-                subtitle: "Switch, rename or remove one"
-            ) { showingTasks = true })
-            out.append(PlusAction(
-                id: "settings", systemImage: "gearshape", title: "Bot settings",
-                subtitle: "Model, profile, voice and notifications"
-            ) { showingProfile = true })
-            out.append(PlusAction(
-                id: "computer", systemImage: "display", title: "Watch computer",
-                subtitle: "Live view of what \(bot.name) is doing"
-            ) { showingComputer = true })
+    private func unavailableScreen(_ title: LocalizedStringKey) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "display")
+                .font(.system(size: 28))
+                .foregroundStyle(Color.secondary)
+            Text(title)
+                .font(.system(size: 17, weight: .semibold))
+            Text("The active connection is no longer available.")
+                .font(.system(size: 14))
+                .foregroundStyle(Color.secondary)
+                .multilineTextAlignment(.center)
         }
-        if case let .room(room) = current, room.dm != true {
-            out.append(PlusAction(
-                id: "task", systemImage: "plus.square.on.square", title: "New thread",
-                subtitle: "Start a fresh conversation in \(room.name)",
-                disabled: current.busy || hasPendingApproval
-            ) { Task { await session.createTask(for: room, title: nil) } })
-            out.append(PlusAction(
-                id: "tasks", systemImage: "square.stack", title: "Threads",
-                subtitle: "Switch, rename or remove one"
-            ) { showingTasks = true })
-        }
-        out.append(PlusAction(
-            id: "share", systemImage: "doc.plaintext", title: "Share transcript",
-            subtitle: "This thread as Markdown"
-        ) {
-            Task {
-                if let url = await session.export(threadId: current.threadId, format: "markdown") {
-                    shareFile = ShareFile(url: url)
-                }
-            }
-        })
-        out.append(PlusAction(
-            id: "share-json", systemImage: "curlybraces", title: "Share as JSON",
-            subtitle: "Structured transcript data"
-        ) {
-            Task {
-                if let url = await session.export(threadId: current.threadId, format: "json") {
-                    shareFile = ShareFile(url: url)
-                }
-            }
-        })
-        if current.busy, case let .bot(bot) = current {
-            out.append(PlusAction(
-                id: "stop", systemImage: "stop.fill", title: "Interrupt",
-                subtitle: "Stop the current turn", destructive: true
-            ) { Task { await session.interrupt(bot: bot) } })
-        }
-        return out
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.appBackground)
     }
 
     /// True when this message opens a fresh stretch of conversation — the
@@ -1215,16 +1167,12 @@ struct ChatView: View {
         return rows[index].at - rows[index - 1].endAt > 30 * 60 * 1000
     }
 
-    /// True when the next message is from someone else (or there is none),
-    /// which is where a run of bubbles gets its tail — one per run, like
-    /// every messaging app, rather than one per bubble.
-    private func endsRun(at index: Int, in rows: [TranscriptRow]) -> Bool {
-        guard index + 1 < rows.count else { return true }
-        let this = rows[index], next = rows[index + 1]
-        if this.role != next.role { return true }
-        if this.senderName != next.senderName { return true }
-        // a card or a tool chip between two texts breaks the run visually
-        return next.kind != .text
+    /// A little more air where the speaker changes, which the old tail used
+    /// to supply. Runs of messages from the same side keep their tight
+    /// spacing.
+    private func roleGap(at index: Int, in rows: [TranscriptRow]) -> CGFloat {
+        guard index > 0 else { return 0 }
+        return rows[index].role == rows[index - 1].role ? 0 : 10
     }
 
     private func canSend(_ typed: String) -> Bool {
@@ -1296,8 +1244,6 @@ struct ChatView: View {
         else { return }
         sendingMessage = true
         attachmentError = nil
-        showCommandHUD = false
-        showingPlus = false
         // Sending is the one time the transcript goes to its end even when
         // the reader had scrolled back: the message lands there.
         readerDetached = false
@@ -1613,7 +1559,7 @@ struct ChatView: View {
     private func composerStack(_ text: Binding<String>, snapshot: TranscriptSnapshot) -> some View {
         let typed = text.wrappedValue
         return VStack(spacing: 6) {
-            let mentions = composerFocused && !showCommandHUD && !dictation.isListening ? mentionChoices(typed) : []
+            let mentions = composerFocused && !dictation.isListening ? mentionChoices(typed) : []
             if !mentions.isEmpty {
                 MentionPicker(choices: mentions, bots: session.state.bots) { choice in
                     Haptics.selection()
@@ -1638,15 +1584,13 @@ struct ChatView: View {
 
             composerNotices
 
-            composerSuggestions(text, pendingApproval: snapshot.hasPendingApproval)
-
             if !attachments.isEmpty {
                 attachmentStrip
             }
 
             composerBar(text)
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
         .frame(maxWidth: CompanionLayout.chatWidth)
@@ -1713,41 +1657,6 @@ struct ChatView: View {
         }
     }
 
-    /// The slash-command HUD while one is being typed, else the Settings
-    /// chips while there is nothing to say yet.
-    @ViewBuilder
-    private func composerSuggestions(_ text: Binding<String>, pendingApproval: Bool) -> some View {
-        if showCommandHUD {
-            CommandSkillHUDView(
-                text: text,
-                isVisible: $showCommandHUD,
-                commands: current.isBot
-                    ? CommandSkillHUDView.defaultCommands
-                    : CommandSkillHUDView.defaultCommands.filter {
-                        $0.id != "computer" && (current.supportsTasks || $0.id != "tasks")
-                    },
-                accentColor: MausPalette.color(current.color)
-            ) { command in
-                switch command.id {
-                case "computer":
-                    draft = ""
-                    showingComputer = true
-                case "tasks":
-                    draft = ""
-                    showingTasks = true
-                default: submit(command.command)
-                }
-            }
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-        } else if text.wrappedValue.isEmpty && attachments.isEmpty && !current.busy
-                    && !pendingApproval && !storedChips.isEmpty {
-            PredictiveActionChipsView(chips: storedChips, accentColor: MausPalette.color(current.color)) { chip in
-                submit(chip.prompt)
-            }
-            .transition(.opacity)
-        }
-    }
-
     private var attachmentStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
@@ -1766,12 +1675,13 @@ struct ChatView: View {
     }
 
     private func composerBar(_ text: Binding<String>) -> some View {
-        GlassGroup(spacing: 10) {
+        let showsSend = !text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !attachments.isEmpty
+        return GlassGroup(spacing: 10) {
             HStack(alignment: .bottom, spacing: 10) {
                 plusButton
 
                 HStack(alignment: .bottom, spacing: 6) {
-                    commandButton
                     composerField(text)
 
                     // Stop sits in the bar while the turn runs, as it does
@@ -1781,8 +1691,16 @@ struct ChatView: View {
                         stopButton
                     }
 
-                    dictationButton
-                    sendButton(canSend: canSend(text.wrappedValue))
+                    // One slot: dictation until there is something to send,
+                    // then the send arrow. While dictation itself is running
+                    // it stays the stop control, even as the transcript fills.
+                    if dictation.isListening || dictation.isStarting {
+                        dictationButton
+                    } else if showsSend {
+                        sendButton(canSend: canSend(text.wrappedValue))
+                    } else {
+                        dictationButton
+                    }
                 }
                 .frame(minHeight: 44)
                 // A capsule at one line (44pt tall, 22pt corners) that
@@ -1794,44 +1712,41 @@ struct ChatView: View {
         }
     }
 
+    private var canAddAttachment: Bool {
+        attachments.count < AttachmentPolicy.maximumItems
+            && !preparingAttachments && !sendingMessage
+    }
+
+    /// Photos and files only, in the system menu the + already speaks.
     private var plusButton: some View {
-        Button {
-            dictation.stop()
-            composerFocused = false
-            withAnimation(.snappy(duration: 0.28)) { showingPlus.toggle() }
+        Menu {
+            Button {
+                showingPhotoPicker = true
+            } label: {
+                Label("Photo Library", systemImage: "photo.on.rectangle")
+            }
+            .disabled(!canAddAttachment)
+
+            Button {
+                showingFileImporter = true
+            } label: {
+                Label("Choose File", systemImage: "paperclip")
+            }
+            .disabled(!canAddAttachment)
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 20, weight: .medium))
-                .foregroundStyle(showingPlus ? Color(uiColor: .systemBackground) : Color.primary)
-                .rotationEffect(.degrees(showingPlus ? 45 : 0))
+                .foregroundStyle(Color.primary)
                 .frame(width: 44, height: 44)
-                .background(Circle().fill(showingPlus ? Color.primary : Color.clear))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .glassCapsule()
         .disabled(preparingAttachments || sendingMessage)
-        .accessibilityLabel(showingPlus ? "Close" : "More")
-    }
-
-    private var commandButton: some View {
-        Button {
+        .accessibilityLabel("Add attachment")
+        .simultaneousGesture(TapGesture().onEnded {
             dictation.stop()
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                showCommandHUD.toggle()
-            }
-            Haptics.selection()
-        } label: {
-            Image(systemName: "command")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(showCommandHUD ? Color.primary : Color.secondary)
-                .frame(width: 30, height: 32)
-        }
-        .buttonStyle(.plain)
-        .disabled(preparingAttachments || sendingMessage)
-        .accessibilityLabel("Slash commands")
-        .padding(.leading, 6)
-        .padding(.bottom, 6)
+        })
     }
 
     private func composerField(_ text: Binding<String>) -> some View {
@@ -1843,6 +1758,7 @@ struct ChatView: View {
             .lineLimit(1...5)
             .font(.system(size: 17))
             .padding(.vertical, 11)
+            .padding(.leading, 16)
             .focused($composerFocused)
             .accessibilityIdentifier("message-input")
             // Partial transcripts rebuild from a frozen base;
@@ -1851,11 +1767,6 @@ struct ChatView: View {
                 !dictation.isListening && !dictation.isStarting
                     && !preparingAttachments && !sendingMessage
             )
-            .onValueChange(of: text.wrappedValue) { value in
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    showCommandHUD = value.hasPrefix("/")
-                }
-            }
             // The software keyboard's Return inserts a newline,
             // like Messages; only the arrow button sends. A
             // hardware Return still sends, Shift-Return breaks
@@ -1899,6 +1810,7 @@ struct ChatView: View {
         .buttonStyle(.plain)
         .disabled(preparingAttachments || sendingMessage || liveCall.machine.isActive)
         .padding(.bottom, 6)
+        .padding(.trailing, 6)
         .accessibilityLabel(listening ? "Stop dictation" : "Start dictation")
     }
 
@@ -1946,22 +1858,6 @@ private struct DraftReader<Content: View>: View {
     }
 
     var body: some View { content($draft.text) }
-}
-
-/// The Settings chip row, decoded once per edit of the setting rather than
-/// twice on every render of the composer.
-@MainActor
-private enum StoredChips {
-    private static var memo: (raw: String, chips: [ActionChipItem])?
-
-    static func chips(_ raw: String) -> [ActionChipItem] {
-        if let memo, memo.raw == raw { return memo.chips }
-        let chips = QuickReply.decode(raw).map {
-            ActionChipItem(id: $0.id, title: $0.title, icon: $0.icon, prompt: $0.prompt)
-        }
-        memo = (raw, chips)
-        return chips
-    }
 }
 
 /// Where the transcript's end sits against the bottom of the screen, as of
@@ -2039,8 +1935,6 @@ private struct FollowsLatest: ViewModifier {
 struct MessageRow: View, Equatable {
     let message: Message
     var versions: [Message] = []
-    /// Last bubble of a run from the same side: the one that gets the tail.
-    var endsRun = true
     /// The stand-in for an edit the computer has not answered yet. It has no
     /// server identity, so nothing may react to it or edit it again.
     var isPendingEdit = false
@@ -2058,11 +1952,9 @@ struct MessageRow: View, Equatable {
     /// A digest chip's parts, and its sheet's presentation.
     @State private var digest: DigestSummary?
 
-    private static let reactionChoices = ["👍", "❤️", "😂", "🎉", "👀"]
-
     /// Everything the row draws, its own state aside.
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.message == rhs.message && lhs.versions == rhs.versions && lhs.endsRun == rhs.endsRun
+        lhs.message == rhs.message && lhs.versions == rhs.versions
             && lhs.isPendingEdit == rhs.isPendingEdit && lhs.routineRun == rhs.routineRun
             && lhs.context == rhs.context && lhs.actions == rhs.actions
     }
@@ -2156,24 +2048,13 @@ struct MessageRow: View, Equatable {
 
     @ViewBuilder
     private func menu(_ presentation: MessagePresentation) -> some View {
-        if !isPendingEdit {
-            ForEach(Self.reactionChoices, id: \.self) { emoji in
-                Button(emoji) {
-                    Haptics.selection()
-                    Task { await actions.react(to: message, emoji: emoji) }
-                }
-            }
-        }
         let visibleText = presentation.visibleText
         if !visibleText.isEmpty {
-            Divider()
             Button("Copy", systemImage: "doc.on.doc") {
                 PlatformBridge.copyToPasteboard(visibleText)
             }
-        }
-        // Copy above takes the whole reply. Selection happens in a sheet
-        // because long-press on the bubble already opens this menu.
-        if !visibleText.isEmpty {
+            // Copy takes the whole reply. Selection happens in a sheet
+            // because long-press on the bubble already opens this menu.
             Button("Select Text", systemImage: "selection.pin.in.out") {
                 selecting = SelectableText(text: visibleText)
             }
@@ -2187,7 +2068,7 @@ struct MessageRow: View, Equatable {
            presentation.attached.attachments.isEmpty,
            !isPendingEdit,
            context.isBot {
-            Divider()
+            if !visibleText.isEmpty { Divider() }
             Button("Edit and retry", systemImage: "pencil") {
                 editingText = message.text ?? ""
                 showingEdit = true
@@ -2267,7 +2148,7 @@ struct MessageRow: View, Equatable {
     }
 
     private func bubble(_ presentation: MessagePresentation) -> TextBubble {
-        TextBubble(message: message, presentation: presentation, context: context, tailed: endsRun, actions: actions)
+        TextBubble(message: message, presentation: presentation, context: context, actions: actions)
     }
 
     private func reactionGroups(_ reactions: [Reaction]) -> [(emoji: String, count: Int, mine: Bool)] {
@@ -2277,10 +2158,6 @@ struct MessageRow: View, Equatable {
     }
 }
 
-private struct ShareFile: Identifiable {
-    let url: URL
-    var id: String { url.path }
-}
 
 /// A message's text on its way to the selection sheet.
 struct SelectableText: Identifiable {
@@ -2288,15 +2165,6 @@ struct SelectableText: Identifiable {
     let text: String
 }
 
-private struct ActivityShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
-}
 
 struct TextBubble: View {
     let message: Message
@@ -2304,12 +2172,12 @@ struct TextBubble: View {
     /// message by `MessageRow`.
     let presentation: MessagePresentation
     let context: TranscriptRowContext
-    var tailed = true
     let actions: TranscriptActions
 
     var body: some View {
         let mine = message.role == .user
         let customCard = presentation.patch != nil
+        let mineText = BubbleColor.mineText(for: context.color)
         // rooms attribute each line to the member who said it
         let speaker = message.from
         // No face beside the bubble: the bot's face is in the header, and in
@@ -2329,7 +2197,7 @@ struct TextBubble: View {
                 ForEach(message.generatedImages, id: \.path) { attachment in
                     TranscriptAttachmentView(
                         attachment: attachment, messageId: message.id, actions: actions,
-                        foreground: mine ? BubbleColor.mineText : .primary
+                        foreground: mine ? mineText : .primary
                     )
                 }
                 // Documents, audio and video a bot sent with attach_file. The
@@ -2337,14 +2205,14 @@ struct TextBubble: View {
                 ForEach(message.attachedFiles, id: \.path) { attachment in
                     TranscriptAttachmentView(
                         attachment: attachment, messageId: message.id, actions: actions,
-                        foreground: mine ? BubbleColor.mineText : .primary
+                        foreground: mine ? mineText : .primary
                     )
                 }
                 words(mine: mine)
                 if mine, message.steered == true {
                     Text("sent mid-turn")
                         .font(.system(size: 11))
-                        .foregroundStyle(BubbleColor.mineText.opacity(0.72))
+                        .foregroundStyle(mineText.opacity(0.72))
                 }
             }
             .padding(.horizontal, customCard ? 0 : 15)
@@ -2352,13 +2220,11 @@ struct TextBubble: View {
             .background(
                 Group {
                     if !customCard {
-                        SpeechBubble(tail: tailed ? (mine ? .trailing : .leading) : .none)
-                            .fill(mine ? BubbleColor.mine : BubbleColor.theirs)
+                        SpeechBubble(tail: .none)
+                            .fill(mine ? BubbleColor.mine(for: context.color) : BubbleColor.theirs)
                     }
                 }
             )
-            // leave room for the tail below, so the next row does not sit on it
-            .padding(.bottom, !customCard && tailed ? SpeechBubble.tailDrop() : 0)
 
             if !mine { Spacer(minLength: 44) }
         }
@@ -2381,7 +2247,7 @@ struct TextBubble: View {
             if !shared.text.isEmpty {
                 Text(shared.text)
                     .font(.system(size: 17))
-                    .foregroundStyle(BubbleColor.mineText)
+                    .foregroundStyle(BubbleColor.mineText(for: context.color))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -3393,8 +3259,7 @@ struct StreamingBubble: View {
             }
             .padding(.horizontal, 15)
             .padding(.vertical, 11)
-            .background(SpeechBubble(tail: .leading).fill(BubbleColor.theirs))
-            .padding(.bottom, SpeechBubble.tailDrop())
+            .background(SpeechBubble(tail: .none).fill(BubbleColor.theirs))
             Spacer(minLength: 44)
         }
         // No `.textSelection` on purpose: selecting text that is still growing
@@ -3497,7 +3362,6 @@ private struct QueuedSendList: View {
                 .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
             }
         }
-        .padding(.horizontal, 4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(sends.count == 1 ? "1 queued message" : "\(sends.count) queued messages")
     }
@@ -3556,5 +3420,40 @@ private struct MentionPicker: View {
         .padding(.horizontal, 4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Mention someone")
+    }
+}
+
+extension View {
+    /// iOS 26's progressive blur under the top edge; older systems already
+    /// draw their own header backdrop.
+    @ViewBuilder
+    func softTopScrollEdgeEffect() -> some View {
+        if #available(iOS 26.0, *) {
+            scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            self
+        }
+    }
+
+    /// The same progressive blur at the end of a list, so rows dissolve
+    /// under the floating bottom bar instead of stopping hard against it.
+    @ViewBuilder
+    func softBottomScrollEdgeEffect() -> some View {
+        if #available(iOS 26.0, *) {
+            scrollEdgeEffectStyle(.soft, for: .bottom)
+        } else {
+            self
+        }
+    }
+
+    /// The platform's default top edge treatment, the one a system bar
+    /// gets. A little stronger than `.soft`; no extra material on top.
+    @ViewBuilder
+    func automaticTopScrollEdgeEffect() -> some View {
+        if #available(iOS 26.0, *) {
+            scrollEdgeEffectStyle(.automatic, for: .top)
+        } else {
+            self
+        }
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import UserNotifications
+import UIKit
 import CompanionCore
 
 /// The on-device notification surface. Delivery comes from live or replayed
@@ -26,7 +27,12 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         (try? await center.requestAuthorization(options: [.alert, .badge, .sound])) == true
     }
 
+    /// Only requests arriving while this app is not on screen become iOS
+    /// notifications. While the person is in the app, the roster and Updates
+    /// bar are the signal; a banner would duplicate them.
+    @MainActor
     func deliver(_ notification: NotificationFrame, sequence: Int?) {
+        guard UIApplication.shared.applicationState == .background else { return }
         let content = UNMutableNotificationContent()
         content.title = notification.title
         content.body = notification.body
@@ -46,6 +52,13 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
     }
 
+    /// Opening the app takes every delivered alert out of Notification
+    /// Centre; what still matters is in the roster.
+    @MainActor
+    func clearDelivered() {
+        center.removeAllDeliveredNotifications()
+    }
+
     func setBadge(_ count: Int) {
         let count = max(0, count)
         guard count != lastBadgeCount else { return }
@@ -62,7 +75,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .list, .sound, .badge])
+        // A notification scheduled in the background can land just as the
+        // person returns; never show it over the app itself.
+        completionHandler([])
     }
 
     func userNotificationCenter(

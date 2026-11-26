@@ -208,14 +208,6 @@ final class ChatPreferencesTests: XCTestCase {
         XCTAssertEqual(QuickReply.decode(QuickReply.encode(replies)), QuickReply.defaults)
     }
 
-    // MARK: - Island intro
-
-    func testIslandIntroDefaultsToOncePerBot() {
-        XCTAssertEqual(IslandIntro.oncePerBot.rawValue, "oncePerBot")
-        XCTAssertEqual(IslandIntro(rawValue: "nonsense"), nil)
-        XCTAssertEqual(IslandIntro.allCases.count, 3)
-    }
-
     // MARK: - Digests
 
     // The harness writes a "[digest] · tools: … · reply: …" receipt after

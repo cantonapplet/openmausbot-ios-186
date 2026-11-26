@@ -16,22 +16,37 @@ struct GlassSurface<S: InsettableShape>: ViewModifier {
 
     func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {
-            let base: Glass = interactive ? .regular.interactive() : .regular
-            content.glassEffect(tint.map { base.tint($0) } ?? base, in: shape)
-        } else {
+            // Plain system glass: no tint, no size offset, no transition.
             content
+                .glassEffect(Glass.regular.interactive(interactive), in: shape)
+        } else {
+            // Before Liquid Glass: a flat page-coloured fill and a hairline.
+            // It keeps the controls readable over bubbles and photos and
+            // reads as one system across every floating surface. The thin
+            // white wash lifts the fill just above the page without
+            // bringing the gloss back. A quiet material behind it softens
+            // whatever scrolls underneath.
+            content
+                .background(tint?.opacity(0.14) ?? .clear, in: shape)
+                .background(Color.white.opacity(0.05), in: shape)
+                .background(Color.appBackground.opacity(0.66), in: shape)
                 .background(.ultraThinMaterial, in: shape)
-                .background(tint?.opacity(0.18) ?? .clear, in: shape)
-                .overlay(shape.strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5))
+                .overlay(shape.strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
         }
     }
 }
 
 extension View {
     /// A capsule of glass — pills and round buttons.
+    ///
+    /// Drawn slightly outside its frame. A system Liquid Glass control shows
+    /// about a point more glass than its 44pt content box; matching that
+    /// keeps these custom surfaces from reading a size smaller than the
+    /// toolbar's own controls.
     func glassCapsule(interactive: Bool = true, tint: Color? = nil) -> some View {
         modifier(GlassSurface(shape: Capsule(), interactive: interactive, tint: tint))
     }
+
 
     /// A rounded sheet of glass.
     func glassSheet(cornerRadius: CGFloat = 28, tint: Color? = nil) -> some View {
@@ -40,6 +55,11 @@ extension View {
             interactive: false,
             tint: tint
         ))
+    }
+
+    /// A full-width bar of the same chrome — inset bars and footer actions.
+    func chromeBar(tint: Color? = nil) -> some View {
+        modifier(GlassSurface(shape: Rectangle(), interactive: false, tint: tint))
     }
 }
 

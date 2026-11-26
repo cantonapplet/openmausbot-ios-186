@@ -348,10 +348,8 @@ private enum LiveCallColor {
     /// light mode a deeper red (#D70015), as the system red is too pale on
     /// the pale green for its button to stand out.
     static let red = adaptive(light: UIColor(red: 0.843, green: 0, blue: 0.082, alpha: 1), dark: .systemRed)
-    /// Try again, on a stopped call's plain glass: the system blue in dark
-    /// mode; in light mode a deeper blue (#0040DD), as the system blue reads
-    /// at 3.5:1 there.
-    static let action = adaptive(light: UIColor(red: 0, green: 0.251, blue: 0.867, alpha: 1), dark: .systemBlue)
+    /// Try again, on a stopped call's plain glass: the app's neutral accent.
+    static let action = Color.accentColor
     /// The person's own words on the caption line: grey, yet dark (or light)
     /// enough for small text on either tint, which `.secondary` is not.
     static let ownWords = Color.primary.opacity(0.7)

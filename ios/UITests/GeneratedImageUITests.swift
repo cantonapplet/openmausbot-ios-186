@@ -7,14 +7,23 @@ final class GeneratedImageUITests: XCTestCase {
         app.terminate()
         app.launchArguments = ["-store-preview", "-threads-preview", "-images-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES"]
         app.launch()
-        let toggle = app.buttons["threads-toggle.preview-pepper"]
-        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
-        toggle.tap()
-        app.buttons["thread.preview-gmail"].tap()
+        let pepper = app.buttons["chat-row.preview-pepper"]
+        XCTAssertTrue(pepper.waitForExistence(timeout: 10))
+        pepper.tap()
+        let header = app.buttons["header-bot-actions"]
+        XCTAssertTrue(header.waitForExistence(timeout: 10))
+        let onGmail = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "Triage Gmail"), object: header
+        )
+        if XCTWaiter.wait(for: [onGmail], timeout: 3) != .completed {
+            app.openThreadsFromHeader()
+            let gmail = app.buttons["thread-preview-gmail"]
+            XCTAssertTrue(gmail.waitForExistence(timeout: 5))
+            gmail.tap()
+        }
         let image = app.buttons["Image: screenshot.png"]
         let appeared = image.waitForExistence(timeout: 5)
         record("Agent image in transcript", app)
@@ -24,10 +33,10 @@ final class GeneratedImageUITests: XCTestCase {
         expectation(for: loaded, evaluatedWith: image)
         waitForExpectations(timeout: 10)
         image.tap()
-        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.otherElements["Image canvas"].waitForExistence(timeout: 10))
         record("Agent image full screen", app)
-        app.buttons["Done"].tap()
+        app.buttons["Close"].tap()
         XCTAssertTrue(image.waitForExistence(timeout: 5))
     }
 

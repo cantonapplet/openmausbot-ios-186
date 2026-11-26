@@ -93,8 +93,8 @@ struct LiveCallSettingsSheet: View {
             .navigationTitle("Live call settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                ToolbarItem(placement: .topBarLeading) {
+                    CloseButton()
                 }
             }
             .safeAreaInset(edge: .top, spacing: 0) {
@@ -104,7 +104,7 @@ struct LiveCallSettingsSheet: View {
                         .font(.subheadline)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding()
-                        .background(.regularMaterial)
+                        .chromeBar()
                         .accessibilityElement(children: .combine)
                         .accessibilityIdentifier("live-call-settings-error")
                 }

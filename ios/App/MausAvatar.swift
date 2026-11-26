@@ -31,6 +31,20 @@ enum MausPalette {
         Color(hex: hex[name] ?? "#8E8E93")
     }
 
+    /// Whether white type on this colour would be hard to read — yellow and
+    /// orange need a dark label, the rest are dark enough for white.
+    static func isLight(_ name: String) -> Bool {
+        guard let value = hex[name].flatMap({ UInt32($0.dropFirst(), radix: 16) }) else { return false }
+        func linear(_ component: UInt32) -> Double {
+            let c = Double(component) / 255
+            return c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        let luminance = 0.2126 * linear((value >> 16) & 0xFF)
+            + 0.7152 * linear((value >> 8) & 0xFF)
+            + 0.0722 * linear(value & 0xFF)
+        return luminance > 0.35
+    }
+
 }
 
 /// The viewport half of the silhouette: how the face box lands in a rect.
@@ -80,6 +94,7 @@ struct MausAvatar: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.colorScheme) private var colorScheme
     /// Set by a screen that can show many busy faces at once (comfortable
     /// Home), so only so many of them move; nil everywhere else.
     @Environment(\.mascotMotionBudget) private var motionBudget
@@ -95,6 +110,9 @@ struct MausAvatar: View {
         }
     }
 
+    /// White on the light page, the page's own dark grey on the dark one.
+    private var faceInk: Color { colorScheme == .dark ? Color(hex: "#141414") : .white }
+
     private func face(moving: Bool) -> some View {
         // Even an opted-in face stops when the app is not active: nothing is
         // watching, and in the background the redraws only cost battery.
@@ -103,7 +121,7 @@ struct MausAvatar: View {
             Canvas { context, canvasSize in
                 engine.setState(state, now: timeline.date)
                 if live { engine.step(now: timeline.date) }
-                engine.draw(in: &context, size: canvasSize, color: color, bodyId: bodyId, bodyMotion: live, comets: comets, at: timeline.date)
+                engine.draw(in: &context, size: canvasSize, color: color, bodyId: bodyId, bodyMotion: live, comets: comets, ink: faceInk, at: timeline.date)
             }
         }
         .frame(width: size, height: size)
@@ -197,12 +215,13 @@ struct MausFaceStill: View {
     var comets: Bool = false
     /// The clock for the comets' phase; a different date is a different frame.
     var at: Date = Date()
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Canvas { context, canvasSize in
             let engine = MausFaceEngine()
             engine.setState(state, now: Date(timeIntervalSinceReferenceDate: 0))
-            engine.draw(in: &context, size: canvasSize, color: color, bodyId: bodyId, bodyMotion: false, comets: comets, at: at)
+            engine.draw(in: &context, size: canvasSize, color: color, bodyId: bodyId, bodyMotion: false, comets: comets, ink: colorScheme == .dark ? Color(hex: "#141414") : .white, at: at)
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
@@ -440,7 +459,7 @@ final class MausFaceEngine {
     /// face is doing — the island's "something is happening" — in addition to
     /// the states that carry their own. `at` is the clock; pass a fixed date
     /// for a still frame.
-    func draw(in context: inout GraphicsContext, size: CGSize, color: String, bodyId: String? = MausSilhouette.defaultBody, bodyMotion: Bool, comets: Bool = false, at now: Date = Date()) {
+    func draw(in context: inout GraphicsContext, size: CGSize, color: String, bodyId: String? = MausSilhouette.defaultBody, bodyMotion: Bool, comets: Bool = false, ink: Color = .white, at now: Date = Date()) {
         let rect = CGRect(origin: .zero, size: size)
         context.concatenate(MausSilhouette.fit(rect))
         let elapsed = CGFloat(now.timeIntervalSince(stateStart) * 1000)
@@ -461,12 +480,12 @@ final class MausFaceEngine {
         if bodyMotion {
             bodyContext.concatenate(bodyTransform(MausFaceData.motion[state] ?? MausBodyMotion(), elapsed: elapsed))
         }
-        drawBody(in: &bodyContext, color: color, bodyId: bodyId, now: now)
+        drawBody(in: &bodyContext, color: color, bodyId: bodyId, ink: ink, now: now)
 
         for piece in pieces where piece.front { context.fill(piece.path, with: piece.shading) }
     }
 
-    private func drawBody(in context: inout GraphicsContext, color: String, bodyId: String?, now: Date) {
+    private func drawBody(in context: inout GraphicsContext, color: String, bodyId: String?, ink: Color, now: Date) {
         // Wrapping the cached `CGPath` is a retain, not a re-parse: the body
         // is parsed and placed once per id, inside `CompanionCore`.
         let body = Path(MausSilhouette.inFaceBox(bodyId))
@@ -501,14 +520,14 @@ final class MausFaceEngine {
                 if i == 0 { path.move(to: q) } else { path.addLine(to: q) }
             }
             path.closeSubpath()
-            context.fill(path, with: .color(.white))
+            context.fill(path, with: .color(ink))
         }
 
         let spec = displayedMouth()
         let frame = Self.mouthFrame(rings, spec)
         context.stroke(
             Self.mouthPath(frame, spec),
-            with: .color(.white),
+            with: .color(ink),
             style: StrokeStyle(lineWidth: MausFaceData.mouthStroke, lineCap: .round)
         )
     }

@@ -16,12 +16,21 @@ enum BrowserPreview {
 
 struct BrowserPreviewNavigation: View {
     let bot: Bot
+
+    private var opensControl: Bool {
+        ProcessInfo.processInfo.arguments.contains("-browser-control-preview")
+    }
+
     var body: some View {
         NavigationStack {
-            List {
-                NavigationLink("Open browser") { BrowserControlView(bot: bot, client: BrowserPreview.client) }
+            if opensControl {
+                BrowserControlView(bot: bot, client: BrowserPreview.client)
+            } else {
+                List {
+                    NavigationLink("Open browser") { BrowserControlView(bot: bot, client: BrowserPreview.client) }
+                }
+                .navigationTitle("Browser fixture")
             }
-            .navigationTitle("Browser fixture")
         }
     }
 }

@@ -23,11 +23,10 @@ final class ResponsivenessUITests: XCTestCase {
 
     @MainActor
     func testShortChatTypingAndThreadSwitchingDuringBusyFleet() {
-        let app = launchBusyFleet()
-        let threads = app.buttons["threads-toggle.preview-pepper"]
-        XCTAssertTrue(threads.waitForExistence(timeout: 10))
-        threads.tap()
-        app.buttons["thread.preview-gmail"].tap()
+        // Start on Gmail directly: the roster menu costs a press the flood
+        // does not wait for, and this test is about the chat under load.
+        let app = launchBusyFleet(opensGmail: true)
+        XCTAssertTrue(app.buttons["header-bot-actions"].waitForExistence(timeout: 10))
 
         let progress = app.staticTexts["busy-fleet-progress"]
         let redraws = app.staticTexts["transcript-row-redraws"]
@@ -167,7 +166,7 @@ final class ResponsivenessUITests: XCTestCase {
     /// `detail` is the Activity setting. The phone's default, Hidden, sends a
     /// working bot's reply to the status line; Full streams it as a bubble
     /// in the transcript, which is the case these tests are about.
-    private func launchBusyFleet(detail: String? = nil) -> XCUIApplication {
+    private func launchBusyFleet(detail: String? = nil, opensGmail: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         addTeardownBlock { app.terminate() }
@@ -175,11 +174,11 @@ final class ResponsivenessUITests: XCTestCase {
         app.launchArguments = [
             "-store-preview", "-threads-preview", "-busy-fleet-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.prefs.rosterDensity", "comfortable",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES"
         ] + (detail.map { ["-companion.prefs.activityDetail", $0] } ?? [])
+            + (opensGmail ? ["-open-preview-gmail"] : [])
         app.launch()
         // A first launch can come up before the preview store is read;
         // StopButtonUITests meets the same thing the same way.
@@ -187,8 +186,11 @@ final class ResponsivenessUITests: XCTestCase {
             app.terminate()
             app.launch()
         }
-        // The app reopens the last chat; start from the roster either way.
-        if app.buttons["Back"].waitForExistence(timeout: 2) { app.buttons["Back"].tap() }
+        // The app reopens the last chat; start from the roster either way,
+        // unless this launch asked for Gmail directly.
+        if !opensGmail, app.buttons["Back"].waitForExistence(timeout: 2) {
+            app.buttons["Back"].tap()
+        }
         return app
     }
 
@@ -259,13 +261,13 @@ final class ResponsivenessUITests: XCTestCase {
 
     @MainActor
     private func selectThread(_ id: String, title: String, in app: XCUIApplication) {
-        app.buttons["header-threads"].tap()
+        app.openThreadsFromHeader()
         let thread = app.buttons["thread-\(id)"]
         XCTAssertTrue(thread.waitForExistence(timeout: 10))
         thread.tap()
         let titleArrived = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "value == %@", title),
-            object: app.buttons["header-threads"]
+            object: app.buttons["header-bot-actions"]
         )
         XCTAssertEqual(XCTWaiter.wait(for: [titleArrived], timeout: 10), .completed)
     }

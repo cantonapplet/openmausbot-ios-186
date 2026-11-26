@@ -280,6 +280,8 @@ struct BrowserControlView: View {
     @FocusState private var keyboardFocused: Bool
     @State private var typedBuffer = ""
     @State private var surface: BrowserTouchSurface.Coordinator?
+    @State private var modifiersCanScrollLeft = false
+    @State private var modifiersCanScrollRight = false
 
     init(bot: Bot, client: BrowserLiveClient) {
         self.bot = bot
@@ -292,7 +294,10 @@ struct BrowserControlView: View {
             VStack(spacing: 0) {
                 chrome
                 screen
-                if model.driving { modifierBar }
+                if model.driving {
+                    modifierBar
+                    drivingBar
+                }
             }
         }
         .navigationTitle(bot.name)
@@ -330,36 +335,60 @@ struct BrowserControlView: View {
     }
 
     private var chrome: some View {
-        HStack(spacing: 10) {
-            Button { Task { await model.command("back") } } label: { Image(systemName: "chevron.left") }
-                .accessibilityLabel("Back in browser")
-                .disabled(!model.driving)
-            Button { Task { await model.command("reload") } } label: { Image(systemName: "arrow.clockwise") }
-                .accessibilityLabel("Reload browser")
-                .disabled(!model.driving)
+        HStack(spacing: 8) {
+            chromeButton("chevron.left", label: "Back in browser", disabled: !model.driving) {
+                Task { await model.command("back") }
+            }
+            chromeButton("arrow.clockwise", label: "Reload browser", disabled: !model.driving) {
+                Task { await model.command("reload") }
+            }
 
-            TextField("Address", text: $address)
-                .textFieldStyle(.roundedBorder)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .submitLabel(.go)
-                .focused($addressFocused)
-                .disabled(!model.driving)
-                .onSubmit { Task { await model.navigate(address) } }
-                // The page's own navigation must not overwrite what someone
-                // is halfway through typing.
-                .onValueChange(of: model.url) { url in if !addressFocused { address = url } }
+            HStack(spacing: 7) {
+                Image(systemName: "globe")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.secondary)
+                TextField("Address", text: $address)
+                    .font(.system(size: 15))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .focused($addressFocused)
+                    .disabled(!model.driving)
+                    .onSubmit { Task { await model.navigate(address) } }
+                    // The page's own navigation must not overwrite what someone
+                    // is halfway through typing.
+                    .onValueChange(of: model.url) { url in if !addressFocused { address = url } }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .glassCapsule(interactive: false)
 
             Picker("", selection: $model.mode) {
                 Image(systemName: "hand.tap").tag(GestureMode.direct)
                 Image(systemName: "rectangle.and.hand.point.up.left").tag(GestureMode.trackpad)
             }
             .pickerStyle(.segmented)
-            .frame(width: 96)
+            .frame(width: 88)
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
+        .chromeBar()
+    }
+
+    private func chromeButton(
+        _ systemImage: String, label: LocalizedStringKey, disabled: Bool, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.primary)
+                .frame(width: 36, height: 36)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassCapsule()
+        .disabled(disabled)
+        .accessibilityLabel(label)
     }
 
     private var screen: some View {
@@ -419,9 +448,11 @@ struct BrowserControlView: View {
                         typedBuffer = ""
                     }
 
-                VStack {
-                    Spacer()
-                    controlBar
+                if !model.driving {
+                    VStack {
+                        Spacer()
+                        controlBar
+                    }
                 }
             }
         }
@@ -451,43 +482,78 @@ struct BrowserControlView: View {
     }
 
     private var controlBar: some View {
-        HStack(spacing: 12) {
-            if model.driving {
-                Button {
-                    keyboardFocused.toggle()
-                } label: {
-                    Label("Keyboard", systemImage: "keyboard")
-                }
-                .buttonStyle(.bordered)
-
-                Button(role: .destructive) {
-                    releaseHeldInput()
-                    Task { await model.releaseControl() }
-                } label: {
-                    Label("Hand back", systemImage: "hand.raised")
-                }
-                .buttonStyle(.borderedProminent)
-            } else if model.streamEnded {
-                Button {
+        Group {
+            if model.streamEnded {
+                chromeAction("Try again", systemImage: "arrow.clockwise") {
                     model.retry(client: session.browserLiveClient())
-                } label: {
-                    Label("Try again", systemImage: "arrow.clockwise")
-                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
             } else {
+                // The one high-contrast action: black on white.
                 Button {
                     Task { await model.takeControl() }
                 } label: {
                     Label("Take control", systemImage: "hand.point.up.left")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Color.black)
                         .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                        .background(Color.white, in: Capsule())
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
                 .disabled(!model.status.connected || model.changingControl)
+                .opacity(model.status.connected && !model.changingControl ? 1 : 0.45)
             }
         }
-        .padding(12)
-        .background(.ultraThinMaterial)
+        .padding(.horizontal, 32)
+        .padding(.bottom, 8)
+    }
+
+    /// Keyboard and Hand back sit under the modifier keys, split across the
+    /// width the way a bottom action bar would be.
+    private var drivingBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                keyboardFocused.toggle()
+            } label: {
+                Label("Keyboard", systemImage: "keyboard")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 48)
+                    .glassCapsule()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Keyboard")
+
+            Button {
+                releaseHeldInput()
+                Task { await model.releaseControl() }
+            } label: {
+                Label("Hand back", systemImage: "hand.raised")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Color.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 48)
+                    .background(Color.red, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Hand back")
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 16)
+    }
+
+    private func chromeAction(
+        _ title: LocalizedStringKey, systemImage: String, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.system(size: 16, weight: .medium))
+                .frame(maxWidth: .infinity)
+                .frame(height: 52)
+                .glassCapsule()
+        }
+        .buttonStyle(.plain)
     }
 
     /// Without this bar there is no Cmd-L, no Escape and no Tab between
@@ -509,29 +575,103 @@ struct BrowserControlView: View {
                 key("⌫", "Backspace")
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
         }
-        .background(.ultraThinMaterial)
+        .modifier(ModifierScrollEdges(
+            canScrollLeft: $modifiersCanScrollLeft,
+            canScrollRight: $modifiersCanScrollRight
+        ))
+        .mask(modifierEdgeMask)
+    }
+
+    /// Fade the key row only where it continues past the edge.
+    private var modifierEdgeMask: some View {
+        HStack(spacing: 0) {
+            LinearGradient(
+                colors: modifiersCanScrollLeft ? [.clear, .black] : [.black, .black],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(width: 22)
+
+            Rectangle().fill(.black)
+
+            LinearGradient(
+                colors: modifiersCanScrollRight ? [.black, .clear] : [.black, .black],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(width: 22)
+        }
     }
 
     private func modifier(_ label: String, bit: Int) -> some View {
-        Button(label) { model.toggleModifier(bit) }
-            .buttonStyle(.bordered)
-            .tint(model.latchedModifiers & bit != 0 ? .accentColor : .secondary)
+        let latched = model.latchedModifiers & bit != 0
+        return Button(label) { model.toggleModifier(bit) }
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(latched ? Color.black : Color.primary)
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .background(latched ? Color.white : Color.clear, in: Capsule())
+            .glassCapsule(interactive: false)
     }
 
     private func key(_ label: String, _ name: String) -> some View {
         Button(label) { model.pressKey(name) }
-            .buttonStyle(.bordered)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(Color.primary)
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .glassCapsule(interactive: false)
     }
 
     private var waiting: some View {
-        VStack(spacing: 12) {
-            ProgressView().tint(.white)
+        VStack(spacing: 10) {
+            Image(systemName: model.streamEnded ? "exclamationmark.triangle" : "display")
+                .font(.system(size: 26))
+                .foregroundStyle(Color.white.opacity(0.7))
             Text(model.streamEnded ? (model.failure ?? "The browser stream ended.")
                  : model.status.connected ? "Waiting for a frame…" : "Connecting to the browser…")
-                .font(.system(size: 15))
-                .foregroundStyle(Color.white.opacity(0.7))
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.85))
+                .multilineTextAlignment(.center)
+            if !model.streamEnded {
+                ProgressView().tint(.white).controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 20)
+        .frame(maxWidth: 300)
+        .glassSheet(cornerRadius: 22)
+    }
+}
+
+
+private struct ScrollEdges: Equatable {
+    var left: Bool
+    var right: Bool
+}
+
+private struct ModifierScrollEdges: ViewModifier {
+    @Binding var canScrollLeft: Bool
+    @Binding var canScrollRight: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollGeometryChange(for: ScrollEdges.self) { geometry in
+                let offset = geometry.contentOffset.x
+                let visible = geometry.containerSize.width
+                let total = geometry.contentSize.width
+                return ScrollEdges(
+                    left: offset > 0.5,
+                    right: offset + visible < total - 0.5
+                )
+            } action: { _, edges in
+                canScrollLeft = edges.left
+                canScrollRight = edges.right
+            }
+        } else {
+            content
         }
     }
 }

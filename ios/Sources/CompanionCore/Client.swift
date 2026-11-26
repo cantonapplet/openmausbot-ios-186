@@ -1852,6 +1852,12 @@ public struct CompanionClient: Sendable {
         ]))
     }
 
+    /// Pins the bot itself in the desktop's sidebar and this phone's roster.
+    public func setBotPinned(botId: String, pinned: Bool) async throws {
+        guard Self.validRouteID(botId) else { throw APIError.badURL }
+        try await send(try makeRequest("PATCH", "/api/bots/\(botId)", body: ["pinned": pinned]))
+    }
+
     public func setTaskPinned(botId: String, threadId: String, pinned: Bool) async throws {
         try await send(try makeRequest("PATCH", "/api/bots/\(botId)/tasks/\(threadId)", body: [
             "pinned": pinned,
@@ -1869,6 +1875,14 @@ public struct CompanionClient: Sendable {
 
     public func deleteTask(botId: String, threadId: String) async throws -> Bot {
         try await send(try makeRequest("DELETE", "/api/bots/\(botId)/tasks/\(threadId)"), as: BotResponse.self).bot
+    }
+
+    /// Removes the bot and its threads from the computer. The server also
+    /// broadcasts a `botDeleted` frame, so other clients drop it without
+    /// waiting for their next fleet refresh.
+    public func deleteBot(botId: String) async throws {
+        guard Self.validRouteID(botId) else { throw APIError.badURL }
+        try await send(try makeRequest("DELETE", "/api/bots/\(botId)"))
     }
 
     public func createTask(groupId: String, title: String? = nil) async throws -> Room {

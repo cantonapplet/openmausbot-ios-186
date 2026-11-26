@@ -45,8 +45,7 @@ struct TypingIndicatorView: View {
             }
             .padding(.horizontal, 15)
             .padding(.vertical, 11)
-            .background(SpeechBubble(tail: .leading).fill(BubbleColor.theirs))
-            .padding(.bottom, SpeechBubble.tailDrop())
+            .background(SpeechBubble(tail: .none).fill(BubbleColor.theirs))
             Spacer(minLength: 44)
         }
         .accessibilityElement(children: .ignore)

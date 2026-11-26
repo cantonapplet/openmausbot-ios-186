@@ -27,6 +27,7 @@ enum WalkieVoiceKey {
     }
 
     static func read() -> String? {
+        guard OpenMausSharedConfiguration.usesKeychain else { return readFile() }
         var query = identity
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -40,6 +41,7 @@ enum WalkieVoiceKey {
 
     @discardableResult
     static func save(_ key: String) -> Bool {
+        guard OpenMausSharedConfiguration.usesKeychain else { return saveFile(key) }
         let data = Data(key.utf8)
         var status = SecItemUpdate(identity as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecItemNotFound {
@@ -52,7 +54,48 @@ enum WalkieVoiceKey {
     }
 
     static func remove() {
+        guard OpenMausSharedConfiguration.usesKeychain else {
+            removeFile()
+            return
+        }
         SecItemDelete(identity as CFDictionary)
+    }
+
+    /// File fallback for builds without a keychain access group. Same
+    /// first-unlock protection as the token file; the directory is inside the
+    /// app sandbox and the file is never shared with an extension.
+    private static var fileURL: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("MausWalkie", isDirectory: true)
+            .appendingPathComponent("elevenlabs.key", isDirectory: false)
+    }
+
+    private static func readFile() -> String? {
+        guard let fileURL, let data = try? Data(contentsOf: fileURL),
+              let key = String(data: data, encoding: .utf8), !key.isEmpty else { return nil }
+        return key
+    }
+
+    private static func saveFile(_ key: String) -> Bool {
+        guard let fileURL else { return false }
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data(key.utf8).write(
+                to: fileURL,
+                options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func removeFile() {
+        guard let fileURL else { return }
+        try? FileManager.default.removeItem(at: fileURL)
     }
 }
 
@@ -130,8 +173,8 @@ struct WalkieVoiceSheet: View {
             .navigationTitle("Walkie voice")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                ToolbarItem(placement: .topBarLeading) {
+                    CloseButton()
                 }
             }
             .task { await loadVoices() }

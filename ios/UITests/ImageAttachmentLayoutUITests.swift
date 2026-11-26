@@ -25,14 +25,15 @@ final class ImageAttachmentLayoutUITests: XCTestCase {
         app.launchArguments = [
             "-store-preview", "-images-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.prefs.rosterDensity", "comfortable",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES",
         ]
         app.launch()
         // The app reopens the last chat; start from the roster either way.
-        if app.buttons["Back"].waitForExistence(timeout: 3) { app.buttons["Back"].tap() }
+        // The fixture can take several seconds to appear; wait for either
+        // the chat it restored or the roster before deciding where we are.
+        if app.buttons["Back"].waitForExistence(timeout: 10) { app.buttons["Back"].tap() }
         let row = app.staticTexts["Iris"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 10), "Iris on the roster")
         let input = app.descendants(matching: .any)["message-input"]
@@ -66,14 +67,14 @@ final class ImageAttachmentLayoutUITests: XCTestCase {
         }
     }
 
-    /// Back, the computer and the composer are the controls a wide row cut
-    /// off; the chat fits the phone when all three are wholly on screen.
+    /// Back, the bot's action menu and the composer are the controls a wide
+    /// row could cut off; the chat fits the phone when all three are wholly
+    /// on screen.
     @MainActor
     private func assertChatOnScreen(_ app: XCUIApplication, window: CGRect, while name: String) {
-        let computer = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Watch Iris")).firstMatch
         let controls = [
             ("Back", app.buttons["Back"]),
-            ("the computer button", computer),
+            ("the bot menu", app.buttons["header-bot-actions"]),
             ("the composer", app.descendants(matching: .any)["message-input"]),
         ]
         for (label, control) in controls {

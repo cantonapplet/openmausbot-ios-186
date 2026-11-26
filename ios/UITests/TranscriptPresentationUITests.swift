@@ -26,6 +26,44 @@ final class TranscriptPresentationUITests: XCTestCase {
         screenshot("Compaction summary opened", in: app)
     }
 
+    /// Opening from Home lands on the very end of the transcript, not a
+    /// frame above it: the newest message rests just above the composer.
+    @MainActor
+    func testOpeningAConversationLandsOnItsVeryEnd() {
+        let app = launchPreview(detail: "hidden")
+        let newest = app.staticTexts["The build failed because a dependency is missing."]
+        let input = app.descendants(matching: .any).matching(identifier: "message-input").firstMatch
+        XCTAssertTrue(newest.waitForExistence(timeout: 5))
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        // The opening landing settles over half a second.
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertLessThanOrEqual(newest.frame.maxY, input.frame.minY, "the end clears the composer")
+        XCTAssertLessThan(input.frame.minY - newest.frame.maxY, 60,
+                          "the transcript opens on its end, not above it")
+        screenshot("Conversation opens on its end", in: app)
+    }
+
+    /// The keyboard lifts the transcript instead of covering its end: no
+    /// custom scroll animation, just the system's own inset.
+    @MainActor
+    func testKeyboardLeavesTheNewestMessageVisible() {
+        let app = launchPreview(detail: "hidden")
+        let input = app.descendants(matching: .any).matching(identifier: "message-input").firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        let newest = app.staticTexts["The build failed because a dependency is missing."]
+        XCTAssertTrue(newest.waitForExistence(timeout: 5))
+        XCTAssertLessThanOrEqual(newest.frame.maxY, input.frame.minY, "the chat opens on its end")
+
+        input.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        // The keyboard settles with its own animation; then the end is
+        // still the end, not tucked under the composer.
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertLessThanOrEqual(newest.frame.maxY, input.frame.minY,
+                                 "the newest message stays above the raised composer")
+        screenshot("Keyboard keeps the end of the chat in view", in: app)
+    }
+
     @MainActor
     func testSearchTargetRevealsIntermediateReply() {
         let app = launchPreview(detail: "hidden", focused: true)
@@ -144,11 +182,10 @@ final class TranscriptPresentationUITests: XCTestCase {
         app.launchArguments = [
             "-store-preview", "-chat-presentation-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.prefs.activityDetail", detail,
-            // These tests open Pepper through its "Threads" row. The update
-            // fixture gives Pepper one thread, which only the comfortable
-            // density lists; the roster itself is RosterDensityUITests' job.
+            // These tests open Pepper from Home. Comfortable Home is flat,
+            // so the row opens the remembered thread and the chat header
+            // makes this fixture's Gmail thread explicit.
             "-companion.prefs.rosterDensity", "comfortable",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES"
@@ -160,10 +197,22 @@ final class TranscriptPresentationUITests: XCTestCase {
         if live { app.launchArguments.append("-chat-live-narration-preview") }
         if typing { app.launchArguments.append("-chat-typing-preview") }
         app.launch()
-        let threads = app.buttons["threads-toggle.preview-pepper"]
-        XCTAssertTrue(threads.waitForExistence(timeout: 10))
-        threads.tap()
-        app.buttons["thread.preview-gmail"].tap()
+        let pepper = app.buttons["chat-row.preview-pepper"]
+        XCTAssertTrue(pepper.waitForExistence(timeout: 10))
+        pepper.tap()
+        let header = app.buttons["header-bot-actions"]
+        XCTAssertTrue(header.waitForExistence(timeout: 10))
+        // The row usually opens Gmail already. Switching again would reload
+        // the thread and lose the focused-message reveal this fixture sets up.
+        let onGmail = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "Triage Gmail"), object: header
+        )
+        if XCTWaiter.wait(for: [onGmail], timeout: 3) != .completed {
+            app.openThreadsFromHeader()
+            let gmail = app.buttons["thread-preview-gmail"]
+            XCTAssertTrue(gmail.waitForExistence(timeout: 5))
+            gmail.tap()
+        }
         return app
     }
 

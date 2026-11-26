@@ -40,7 +40,7 @@ struct TasksRoutinesView: View {
                         }
                         .swipeActions(edge: .trailing) {
                             Button("Delete", role: .destructive) { deleting = routine }
-                            Button("Run now") { Task { await runNow(routine) } }.tint(.blue)
+                            Button("Run now") { Task { await runNow(routine) } }.tint(.accentColor)
                         }
                         .contextMenu {
                             Button("Run now", systemImage: "play.fill") { Task { await runNow(routine) } }

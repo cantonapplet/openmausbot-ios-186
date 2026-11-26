@@ -42,10 +42,25 @@ final class LiveActivityCoordinator {
     /// back just before the fleet went quiet still reaches the island.
     private var heldLineSync: Task<Void, Never>?
     private var heldLineDue: Date?
+    /// One sweep per launch, before this process starts its own activities.
+    private var sweptStaleActivities = false
 
     func attach(to session: Session) {
         self.session = session
         activitiesEnabled = authorization.areActivitiesEnabled
+        // Reinstalling swaps the widget extension under any activity the
+        // previous build left running. End those once per launch so the
+        // next sync creates one from the current extension instead of
+        // updating an island the system can no longer lay out.
+        if !sweptStaleActivities {
+            sweptStaleActivities = true
+            let stale = BotActivity.activities
+            if !stale.isEmpty {
+                Task {
+                    for activity in stale { await activity.end(nil, dismissalPolicy: .immediate) }
+                }
+            }
+        }
         // A language change re-runs the scene's onAppear; the previous
         // reader loop must not outlive the attach that started it.
         enablementTask?.cancel()
@@ -135,16 +150,22 @@ final class LiveActivityCoordinator {
                 sound: .default
             )
             : nil
+        // One activity per busy bot means several can be live at once. The
+        // island shows a single one, chosen by relevance, so an ask must
+        // outrank any amount of background work.
+        let relevance: Double = isAsk ? 100 : 10
         if let existing {
             let newAsk = isAsk && (previous?.threadId != content.threadId || previous?.requestId != content.requestId)
-            Task { await existing.update(.init(state: content, staleDate: nil), alertConfiguration: newAsk ? alert : nil) }
+            let update = ActivityContent(state: content, staleDate: nil, relevanceScore: relevance)
+            Task { await existing.update(update, alertConfiguration: newAsk ? alert : nil) }
             return
         }
         let attributes = BotActivityAttributes(botId: bot.id, threadId: bot.threadId, name: bot.name, color: bot.color)
-        let created = try? BotActivity.request(attributes: attributes, content: .init(state: content, staleDate: nil), pushType: nil)
+        let initial = ActivityContent(state: content, staleDate: nil, relevanceScore: relevance)
+        let created = try? BotActivity.request(attributes: attributes, content: initial, pushType: nil)
         // a fresh activity cannot alert on request; one immediate alerting update does it
         if let alert, let created {
-            Task { await created.update(.init(state: content, staleDate: nil), alertConfiguration: alert) }
+            Task { await created.update(initial, alertConfiguration: alert) }
         }
     }
 

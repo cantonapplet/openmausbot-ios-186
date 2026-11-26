@@ -41,21 +41,21 @@ final class TeamMemoryUITests: XCTestCase {
         app.terminate()
         app.launchArguments = ["-store-preview", "-threads-preview", "-memory-preview", "-open-profile",
                                "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-                               "-companion.prefs.islandIntro", "never", "-companion.prefs.rosterDensity", "comfortable",
+                               "-companion.prefs.rosterDensity", "comfortable",
                                "-companion.onboarding.welcomeSeen", "YES", "-companion.onboarding.notificationsSeen", "YES"]
         if stale { app.launchArguments.append("-memory-stale-preview") }
         app.launch()
-        let threads = app.buttons["threads-toggle.preview-pepper"]
+        let pepper = app.buttons["chat-row.preview-pepper"]
         // Match the existing offline tests: a prewarmed/restored simulator
         // scene can retain its previous navigation on the first launch.
-        if !threads.waitForExistence(timeout: 10) { app.terminate(); app.launch() }
-        XCTAssertTrue(threads.waitForExistence(timeout: 10))
-        threads.tap()
-        app.buttons["thread.preview-gmail"].tap()
+        if !pepper.waitForExistence(timeout: 10) { app.terminate(); app.launch() }
+        XCTAssertTrue(pepper.waitForExistence(timeout: 10))
+        // Flat Home: the bot row opens the conversation; `-open-profile`
+        // then raises the profile this test needs.
+        pepper.tap()
         let memory = app.buttons["Team memory"]
-        if !memory.waitForExistence(timeout: 3) {
-            app.swipeUp()
-        }
+        // More sits below the profile, model and voice sections now.
+        for _ in 0..<8 where !memory.exists { app.swipeUp() }
         XCTAssertTrue(memory.waitForExistence(timeout: 5))
         memory.tap()
         XCTAssertTrue(app.staticTexts["Original HQ"].waitForExistence(timeout: 5))

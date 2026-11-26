@@ -61,7 +61,6 @@ final class ApprovalCardUITests: XCTestCase {
         app.launchArguments = [
             "-store-preview", "-approval-preview",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.prefs.rosterDensity", "comfortable",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES"
@@ -75,8 +74,15 @@ final class ApprovalCardUITests: XCTestCase {
         if !input.waitForExistence(timeout: 3) {
             let row = app.staticTexts[bot].firstMatch
             XCTAssertTrue(row.waitForExistence(timeout: 10), "\(bot) on the roster")
-            // The pending approval raises the island over the roster for
-            // its first seconds, and a tap then lands on the island.
+            // The needs-you island covers the roster until it is put away,
+            // and its caption swallows a tap meant for the row beneath.
+            let needsYou = app.staticTexts
+                .matching(NSPredicate(format: "label CONTAINS %@", "needs you"))
+                .firstMatch
+            if needsYou.exists {
+                app.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.3)).tap()
+                _ = needsYou.waitForNonExistence(timeout: 3)
+            }
             for _ in 0..<3 where !input.exists {
                 row.tap()
                 _ = input.waitForExistence(timeout: 3)

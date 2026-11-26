@@ -76,7 +76,7 @@ struct CompanionWelcomeView: View {
             .padding(.horizontal, 24)
             .padding(.top, 14)
             .padding(.bottom, 8)
-            .background(.ultraThinMaterial)
+            .chromeBar()
         }
     }
 }
@@ -154,7 +154,7 @@ struct UnpairedHomeView: View {
                 .controlSize(.large)
                 .padding(.horizontal, 24)
                 .padding(.vertical, 14)
-                .background(.ultraThinMaterial)
+                .chromeBar()
             }
             .navigationTitle("OpenMausBot")
             .toolbar {
@@ -243,7 +243,7 @@ struct NotificationOnboardingView: View {
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 14)
-            .background(.ultraThinMaterial)
+            .chromeBar()
         }
     }
 }

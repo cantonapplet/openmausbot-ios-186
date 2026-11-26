@@ -35,9 +35,9 @@ struct AssistantTurnChip: View {
             .accessibilityIdentifier("assistant-turn.\(turn.turnId)")
 
             if expanded {
-                ForEach(Array(turn.messages.enumerated()), id: \.element.id) { index, message in
+                ForEach(turn.messages, id: \.id) { message in
                     MessageRow(
-                        message: message, endsRun: index == turn.messages.count - 1,
+                        message: message,
                         context: context, actions: actions
                     )
                     .equatable()

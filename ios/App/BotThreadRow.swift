@@ -27,7 +27,66 @@ struct BotThreadRow: View {
         (task.isClosed || task.isArchived) && runtime == nil && task.unread != true
     }
 
+    /// One tight two-line row, for the threads under a bot on Home.
+    var dense = false
+
     var body: some View {
+        if dense { denseBody } else { regularBody }
+    }
+
+    /// Title, then one line of status beside it and the date at the right.
+    /// The picker keeps the roomier `regularBody`; Home's opened threads are
+    /// there to scan, so they give up a line.
+    private var denseBody: some View {
+        HStack(spacing: 8) {
+            Text(verbatim: task.displayTitle)
+                .font(.system(size: 15, weight: task.unread == true ? .semibold : .regular))
+                .foregroundStyle(dimmed ? Color.secondary : Color.primary)
+                .lineLimit(1)
+                .layoutPriority(1)
+
+            if let runtime {
+                Label(runtime.title, systemImage: runtime.icon)
+                    .font(.caption2)
+                    .foregroundStyle(runtime.color)
+                    .fixedSize()
+            }
+            if task.unread == true {
+                Label("Unread", systemImage: "circle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(Color.accentColor)
+                    .fixedSize()
+            }
+            if task.pinned == true {
+                Image(systemName: "pin.fill")
+                    .font(.caption2)
+                    .accessibilityLabel("Pinned")
+            }
+
+            Spacer(minLength: 4)
+
+            if task.listStamp > 0 {
+                Text(RelativeStamp.list(task.listStamp))
+                    .font(.caption2)
+                    .foregroundStyle(Color.secondary)
+                    .fixedSize()
+            }
+
+            if selected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.vertical, 2)
+        .frame(minHeight: 30)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(task.isArchived ? "Archived" : dimmed ? "Closed" : "")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var regularBody: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(verbatim: task.displayTitle)

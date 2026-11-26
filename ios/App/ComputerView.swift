@@ -28,7 +28,6 @@ struct ComputerView: View {
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
     @State private var confirmingDesktop = false
-    @State private var showingBrowser = false
     @State private var openingDesktop = false
     @State private var desktopURL: URL?
     @State private var desktopError: String?
@@ -124,24 +123,12 @@ struct ComputerView: View {
         .navigationTitle(current.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                // Busy is the difference between "the picture is a moment old"
-                // and "the picture is however it was left" — worth saying,
-                // because a still frame looks identical either way.
-                Text(current.busy == true ? "Preview" : "Idle")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(current.busy == true ? Color.green : Color.secondary)
-            }
-        }
-        .navigationDestination(isPresented: $showingBrowser) {
-            if let client = session.browserLiveClient() {
-                BrowserControlView(bot: current, client: client)
-            } else {
-                VStack(spacing: 12) {
-                    Text("Browser unavailable").font(.headline)
-                    Text("The active connection is no longer available.")
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text(current.name)
+                        .font(.system(size: 17, weight: .semibold))
+                    statusLabel
                 }
-                .padding()
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -153,21 +140,6 @@ struct ComputerView: View {
             // an interactive desktop for it — no button beats a dead one. An
             // older harness never sends cloudBackend, so nil keeps the button.
             // Minting a desktop session is admin-only on a server, too.
-            VStack(spacing: 8) {
-                // Watching is the cheap half and always available; driving
-                // the browser is the half this button leads to.
-                Button {
-                    showingBrowser = true
-                } label: {
-                    Label("Open browser", systemImage: "safari")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(session.browserLiveClient() == nil)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 12)
-
             if current.computer == "cloud" && current.cloudBackend != "vps" && session.canAdminister {
                 VStack(spacing: 8) {
                     if let desktopError {
@@ -197,7 +169,7 @@ struct ComputerView: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 12)
-                .background(.ultraThinMaterial)
+                .chromeBar()
             }
             }
         }
@@ -258,6 +230,20 @@ struct ComputerView: View {
         }
     }
 
+    private var statusLabel: some View {
+        // Busy is the difference between "the picture is a moment old" and
+        // "the picture is however it was left" — worth saying, because a
+        // still frame looks identical either way.
+        HStack(spacing: 5) {
+            Circle()
+                .fill(current.busy == true ? Color.green : Color.secondary)
+                .frame(width: 6, height: 6)
+            Text(current.busy == true ? "Preview" : "Idle")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(current.busy == true ? Color.green : Color.secondary)
+        }
+    }
+
     /// Take or join the Local VM: a person can then drive it from the
     /// trackpad, and the bot's own computer actions are refused until Hand
     /// Back.
@@ -288,7 +274,7 @@ struct ComputerView: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
-        .background(.ultraThinMaterial)
+        .chromeBar()
     }
 
     private func takeControl() async {
@@ -420,7 +406,7 @@ struct ComputerView: View {
             .foregroundStyle(Color.white.opacity(0.85))
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: Capsule())
+            .glassCapsule(interactive: false)
             .padding(.bottom, 12)
     }
 
@@ -437,25 +423,37 @@ struct ComputerView: View {
                 .foregroundStyle(Color.white.opacity(0.55))
         }
         .multilineTextAlignment(.center)
-        .padding(.horizontal, 32)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 22)
+        .frame(maxWidth: 320)
+        .glassSheet(cornerRadius: 22)
     }
 
     private var streamWaiting: some View {
-        VStack(spacing: 12) {
-            ProgressView().tint(.white)
+        VStack(spacing: 10) {
+            if current.busy == true || fetchingFirstStill {
+                ProgressView().tint(.white).controlSize(.small)
+            } else {
+                Image(systemName: "display")
+                    .font(.system(size: 26))
+                    .foregroundStyle(Color.white.opacity(0.7))
+            }
             Text(current.busy == true || fetchingFirstStill ? "Waiting for a frame…" : "Nothing to show yet")
-                .font(.system(size: 15))
-                .foregroundStyle(Color.white.opacity(0.7))
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.85))
             // An idle bot is not being screenshotted at all, so this would
             // otherwise be an indefinite spinner with no explanation.
             if current.busy != true && !fetchingFirstStill {
                 Text("This bot's computer is only captured while it is working.")
                     .font(.system(size: 13))
-                    .foregroundStyle(Color.white.opacity(0.45))
+                    .foregroundStyle(Color.white.opacity(0.5))
                     .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
             }
         }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 22)
+        .frame(maxWidth: 320)
+        .glassSheet(cornerRadius: 22)
     }
 
     @MainActor

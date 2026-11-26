@@ -15,6 +15,10 @@ enum OpenMausSharedKeychain {
     private static let service = "com.openmausbot.companion.token"
 
     static func save(_ token: String, for connectionID: String) throws {
+        guard OpenMausSharedConfiguration.usesKeychain else {
+            try OpenMausLocalTokenStore.save(token, for: connectionID)
+            return
+        }
         do {
             let accessGroup = try requiredAccessGroup()
             try save(
@@ -33,6 +37,9 @@ enum OpenMausSharedKeychain {
     /// read protected data into an accidental unpair; an unavailable
     /// entitlement instead falls back to the local token file.
     static func token(for connectionID: String) throws -> String? {
+        guard OpenMausSharedConfiguration.usesKeychain else {
+            return OpenMausLocalTokenStore.token(for: connectionID)
+        }
         do {
             let accessGroup = try requiredAccessGroup()
             return try readToken(for: connectionID, accessGroup: accessGroup)
@@ -44,6 +51,9 @@ enum OpenMausSharedKeychain {
 
     @discardableResult
     static func remove(_ connectionID: String) -> Bool {
+        guard OpenMausSharedConfiguration.usesKeychain else {
+            return OpenMausLocalTokenStore.remove(connectionID)
+        }
         let fileRemoved = OpenMausLocalTokenStore.remove(connectionID)
         guard let accessGroup = OpenMausSharedConfiguration.keychainAccessGroup else {
             return fileRemoved
@@ -59,6 +69,9 @@ enum OpenMausSharedKeychain {
     /// treated as "no legacy item" rather than an error, so a token already
     /// living in the local file store is still used.
     static func tokenMigratingLegacyItem(for connectionID: String) throws -> String? {
+        guard OpenMausSharedConfiguration.usesKeychain else {
+            return OpenMausLocalTokenStore.token(for: connectionID)
+        }
         if let shared = try token(for: connectionID) { return shared }
         let legacyGroup: String
         do {
@@ -85,6 +98,9 @@ enum OpenMausSharedKeychain {
     /// reviving a pairing the user explicitly forgot.
     @discardableResult
     static func removeIncludingLegacyItem(_ connectionID: String) -> Bool {
+        guard OpenMausSharedConfiguration.usesKeychain else {
+            return remove(connectionID)
+        }
         let sharedRemoved = remove(connectionID)
         guard let legacyGroup = OpenMausSharedConfiguration.legacyAppKeychainAccessGroup else {
             return sharedRemoved

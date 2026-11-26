@@ -111,6 +111,14 @@ final class LiveCallPreviewProtocol: URLProtocol {
         case ("GET", "/api/config"):
             (status, body) = (200, #"{"live":\#(Self.settings)}"#)
             if arguments.contains("-live-call-preview-slow-config") { delay = Self.slowAnswer }
+        case ("GET", "/api/tts/voices"):
+            // Bot settings loads this; an unhandled route would raise the
+            // app's error alert and close the sheet the test just opened.
+            (status, body) = (200, #"{"voices":[]}"#)
+        case ("GET", "/api/instances"):
+            (status, body) = (200, #"{"instances":[]}"#)
+        case ("GET", "/.well-known/openmausbot/environment"):
+            (status, body) = (200, #"{"environmentId":"preview","label":"Preview","platform":"darwin"}"#)
         default:
             client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
             return

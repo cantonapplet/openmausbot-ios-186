@@ -8,22 +8,27 @@
 // two-line rows with a "Threads" disclosure beneath each.
 import SwiftUI
 import CompanionCore
+import UIKit
 
 struct ChatListView: View {
     @EnvironmentObject private var session: Session
-    @EnvironmentObject private var liveCall: LiveCallController
     @State private var query = ""
     @AppStorage(PrefKey.activityDetail) private var activityDetail = ActivityDetail.phoneDefault.rawValue
-    @AppStorage(PrefKey.rosterDensity) private var rosterDensity = RosterDensity.default.rawValue
     /// Driven so that making a bot can open it. Value-based navigation alone
     /// cannot push without a tap, and a new bot appearing silently at the
     /// bottom of the roster is a poor answer to pressing +.
     @State private var path = NavigationPath()
     @State private var searchHits: [SearchHit] = []
+    @State private var botActions: BotActionTarget?
+    @AppStorage(PrefKey.updatesPill) private var updatesPill = false
+#if DEBUG
+    @State private var showingGlassGallery = ProcessInfo.processInfo.arguments.contains("-glass-gallery")
+#endif
     @State private var searching = false
     @State private var searchOpen = false
     @State private var showingUpdates = false
     @State private var showingCalendar = false
+    @State private var showingSettings = false
     @State private var showingWalkie = false
     @State private var showingNewGroup = false
     @State private var showingNewSection = false
@@ -31,6 +36,8 @@ struct ChatListView: View {
     @State private var collapsedFolders = Set<String>()
     @State private var creatingThreads = Set<String>()
     @State private var managingThreads: Chat?
+    @State private var botPendingDeletion: Bot?
+    @State private var profileBot: Bot?
     /// The preview lines comfortable rows and search show, folded again only
     /// for a thread that changed. Filled while rendering: it is a cache,
     /// not something any view observes.
@@ -59,14 +66,6 @@ struct ChatListView: View {
         NavigationStack(path: $path) {
             GeometryReader { geo in
             VStack(spacing: 0) {
-                header
-                StatusBanner()
-                LiveCallBanner { target in
-                    if let bot = session.state.bot(target.botId)?.projected(forThread: target.threadId) {
-                        path.append(Chat.bot(bot))
-                    }
-                }
-
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         if query.isEmpty {
@@ -112,28 +111,62 @@ struct ChatListView: View {
                     .padding(.bottom, Self.listBottomMargin)
                 }
                 .environment(\.mascotMotionBudget, motionBudget)
-                .refreshable { await session.refresh() }
+                // The roster now runs under the header and gets iOS 26's
+                // soft edge effect, the same blend the chat transcript has.
+                .softTopScrollEdgeEffect()
+                .softBottomScrollEdgeEffect()
                 .accessibilityIdentifier("roster-list")
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    VStack(spacing: 0) {
+                        header
+                        StatusBanner()
+                        LiveCallBanner { target in
+                            if let bot = session.state.bot(target.botId)?.projected(forThread: target.threadId) {
+                                path.append(Chat.bot(bot))
+                            }
+                        }
+                    }
+                    .background(rosterHeaderBackground)
+                }
                 .overlay {
                     if rosterIsEmpty(matches: matches) {
-                        EmptyStateView(
-                            query.isEmpty ? "No bots yet" : "Nothing matches",
-                            systemImage: query.isEmpty ? "bubble.left.and.bubble.right" : "magnifyingglass",
-                            description: Text(
-                                query.isEmpty
-                                    ? "Bots you create on your computer show up here."
-                                    : "No thread matches \u{201C}\(query)\u{201D}."
+                        if query.isEmpty, session.status == .connecting {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityLabel("Connecting")
+                        } else if query.isEmpty, case .offline = session.status {
+                            VStack(spacing: 10) {
+                                Image(systemName: "xmark.circle")
+                                    .font(.system(size: 24, weight: .regular))
+                                    .foregroundStyle(.red)
+                                Text("Failed to connect")
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                            }
+                        } else {
+                            EmptyStateView(
+                                query.isEmpty ? "No bots yet" : "Nothing matches",
+                                systemImage: query.isEmpty ? "bubble.left.and.bubble.right" : "magnifyingglass",
+                                description: Text(
+                                    query.isEmpty
+                                        ? "Bots you create on your computer show up here."
+                                        : "No thread matches \u{201C}\(query)\u{201D}."
+                                )
                             )
-                        )
+                        }
                     }
                 }
                 // The list scrolls beneath the floating bar, and its end is
                 // inset by the bar's measured height rather than a guess.
-                .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar(updates: updates) }
+                // On iOS 26 the bar is a safe area bar so the content under
+                // it gets the system's soft scroll edge effect.
+                .rosterBottomBar(visible: searchOpen || updatesPill) { bottomBar(updates: updates) }
             }
             // top-aligned: the roster fills downward from the header
             .frame(maxWidth: CompanionLayout.rosterWidth, maxHeight: .infinity, alignment: .top)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(Color.appBackground.ignoresSafeArea())
+            .overlay(alignment: .center) { botActionsOverlay }
             // a bot that stopped for you grows out of the island
             .overlay(alignment: .top) {
                 if CompanionLayout.supportsIslandPresentation {
@@ -142,7 +175,33 @@ struct ChatListView: View {
             }
             }
             .toolbar(.hidden, for: .navigationBar)
+#if DEBUG
+            .fullScreenCover(isPresented: $showingGlassGallery) {
+                if #available(iOS 26.0, *) {
+                    GlassGalleryView()
+                } else {
+                    EmptyView()
+                }
+            }
+#endif
             .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
+            .confirmationDialog(
+                Text(botPendingDeletion.map { "Delete \($0.name)?" } ?? "Delete bot?"),
+                isPresented: Binding(
+                    get: { botPendingDeletion != nil },
+                    set: { if !$0 { botPendingDeletion = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Delete bot", role: .destructive) {
+                    guard let bot = botPendingDeletion else { return }
+                    botPendingDeletion = nil
+                    Task { await session.deleteBot(bot) }
+                }
+                Button("Cancel", role: .cancel) { botPendingDeletion = nil }
+            } message: {
+                Text("This removes the bot and its threads from your computer.")
+            }
             .onValueChange(of: session.notificationChat) { chat in
                 guard let chat else { return }
                 path.append(chat)
@@ -173,15 +232,51 @@ struct ChatListView: View {
                 if ProcessInfo.processInfo.arguments.contains("-open-walkie") {
                     showingWalkie = true
                 }
+                if ProcessInfo.processInfo.arguments.contains("-open-settings") {
+                    showingSettings = true
+                }
                 if ProcessInfo.processInfo.arguments.contains("-open-first"),
                    path.isEmpty, let first = chats.first {
                     path.append(first.chat)
                 }
+                // Timing-sensitive UI tests start on Gmail directly instead
+                // of walking the roster menu.
+                if ProcessInfo.processInfo.arguments.contains("-open-preview-gmail"),
+                   let bot = session.state.bot(forThread: "preview-gmail") {
+                    path.append(Chat.bot(bot))
+                }
             }
 #endif
+            .navigationDestination(
+                isPresented: Binding(
+                    get: { profileBot != nil },
+                    set: { if !$0 { profileBot = nil } }
+                )
+            ) {
+                if let bot = profileBot {
+                    AgentProfileView(bot: bot)
+                }
+            }
             .sheet(isPresented: $showingCalendar) {
                 RoutineCalendarView()
                     .environmentObject(session)
+            }
+            // A full-screen cover keeps the bottom-up opening motion but
+            // covers the whole screen; the close control lives top left.
+            .fullScreenCover(isPresented: $showingSettings) {
+                NavigationStack {
+                    SettingsView()
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button {
+                                    showingSettings = false
+                                } label: {
+                                    Image(systemName: "xmark")
+                                }
+                                .accessibilityLabel("Close")
+                            }
+                        }
+                }
             }
             .sheet(isPresented: $showingUpdates) {
                 UpdatesSheet { chat in
@@ -234,74 +329,69 @@ struct ChatListView: View {
 
     // MARK: - Header
 
-    /// The paired computer's profile on the left; the routine calendar and
-    /// settings on the right, and where you are in between. The avatar is
-    /// identity, not a second hidden route to the same screen.
+    /// Account on the left, search and create on the right — one row of the
+    /// same round glass controls, no wordmark above it.
     private var header: some View {
         HStack(alignment: .center) {
-            ProfileAvatar(name: session.connection?.name ?? "You", size: 30)
-                .frame(width: 44, height: 44)
-                .glassCapsule(interactive: false)
-                .accessibilityLabel(session.connection.map { LocalizedStringKey("Connected to \($0.name)") }
-                    ?? "Connected to your computer")
+            accountButton
+
+            Spacer(minLength: 8)
 
             Spacer(minLength: 8)
 
             HStack(spacing: 8) {
-                // Routines on a calendar, a tap from Home rather than buried
-                // in Settings (MOCA-191).
-                Button { showingCalendar = true } label: {
-                    Image(systemName: "calendar")
+                Button {
+                    Haptics.selection()
+                    searchOpen = true
+                    searchFocused = true
+                } label: {
+                    Image(systemName: "magnifyingglass")
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(Color.primary)
                         .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
                 .glassCapsule()
-                .accessibilityLabel("Routine calendar")
-                .accessibilityIdentifier("open-calendar")
+                .accessibilityLabel("Search")
 
-                NavigationLink { SettingsView() } label: {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(Color.primary)
-                        .frame(width: 44, height: 44)
+                if session.canAdminister {
+                    Menu {
+                        Button("New bot", systemImage: "square.and.pencil", action: createBot)
+                        Button("New section", systemImage: "folder.badge.plus", action: openNewSection)
+                            .disabled(!hasVisibleBots)
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(Color.primary)
+                            .frame(width: 44, height: 44)
+                    }
+                    .glassCapsule()
+                    .accessibilityLabel("Create")
                 }
-                .buttonStyle(.plain)
-                .glassCapsule()
-                .accessibilityLabel("Settings")
             }
-        }
-        // Centred on the screen, not between the uneven sides.
-        .overlay {
-            VStack(spacing: 2) {
-                Text("Threads")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Color.primary)
-                Text(headerSubtitle)
-                    .font(.system(size: 13))
-                    .foregroundStyle(Color.secondary)
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 104)
         }
         .padding(.horizontal, 16)
         .padding(.top, 4)
         .padding(.bottom, 12)
     }
 
-    private var headerSubtitle: String {
-        let name = session.connection?.name ?? "Not paired"
-        switch session.status {
-        case .live: return "\(name) · connected"
-        case .connecting: return "\(name) · connecting…"
-        case .offline: return "\(name) · offline"
-        case .unauthorized: return "\(name) · unpaired"
-        case .unpaired: return "Not paired"
+    /// iOS 26 supplies the blur at the top edge; older systems need an opaque
+    /// strip so the roster does not run visibly under the header.
+    @ViewBuilder
+    private var rosterHeaderBackground: some View {
+        if #available(iOS 26.0, *) {
+            Color.clear
+        } else {
+            Color.appBackground
         }
     }
 
     // MARK: - Sidebar sections
+
+    /// Whether Home opens with the cross-bot "Needs attention" inbox.
+    /// Hidden for now: the Updates pill at the bottom already says who needs
+    /// the person, and two copies read as two different lists.
+    private static let showsAttentionInbox = false
 
     /// Every thread across every bot that needs the person right now — the
     /// same rule and order as the thread tree, so the inbox can never
@@ -316,7 +406,7 @@ struct ChatListView: View {
         // on it, reads `chats` instead).
         let allSummaries = rosterSummaries(previews: density == .comfortable)
         let attention = self.attention
-        if !attention.isEmpty {
+        if Self.showsAttentionInbox, !attention.isEmpty {
             sectionLabel(Text("Needs attention"))
                 .padding(.top, 2)
                 .padding(.bottom, 4)
@@ -332,46 +422,132 @@ struct ChatListView: View {
             }
         }
 
+        switch density {
+        case .comfortable:
+            comfortableChatList(allSummaries, waiting: waiting)
+        case .compact:
+            compactSections(allSummaries, waiting: waiting)
+        }
+    }
+
+    /// Comfortable Home, flat: one row per conversation, bots and groups
+    /// drawn the same way, in the order a chat app uses — pinned first, then
+    /// the most recently active. The threads inside a bot are reached from
+    /// its chat header, so there are no section titles and no disclosure.
+    private func comfortableChatList(_ allSummaries: [ChatSummary], waiting: Set<String>) -> some View {
+        let rows = allSummaries
+            // A bot's DM room is the same conversation as its bot row, so
+            // only real groups join the flat list.
+            .filter { summary in
+                switch summary.chat {
+                case .bot: return true
+                case let .room(room): return room.dm != true
+                }
+            }
+            .sorted { left, right in
+                if left.pinned != right.pinned { return left.pinned }
+                return left.lastActivity > right.lastActivity
+            }
+        let pinned = rows.filter { summary in
+            if case let .bot(bot) = summary.chat { return bot.pinned == true }
+            return false
+        }
+        let rest = rows.filter { summary in
+            if case let .bot(bot) = summary.chat { return bot.pinned != true }
+            return true
+        }
+        return VStack(spacing: 0) {
+            if !pinned.isEmpty { pinnedStrip(pinned) }
+            comfortableRows(rest, waiting: waiting)
+        }
+    }
+
+    /// Pinned bots sit above the list as large faces with their names under
+    /// them, the way a favourites row reads. The list below omits them.
+    private func pinnedStrip(_ pinned: [ChatSummary]) -> some View {
+        let rows = stride(from: 0, to: pinned.count, by: 3).map {
+            Array(pinned[$0..<min($0 + 3, pinned.count)])
+        }
+        return VStack(spacing: 14) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                HStack(alignment: .top, spacing: 6) {
+                    ForEach(row) { summary in
+                        if case let .bot(bot) = summary.chat {
+                            Button {
+                                path.append(session.threadSelection.restoringThread(
+                                    summary.chat, connectionID: session.connection?.id
+                                ))
+                            } label: {
+                                VStack(spacing: 8) {
+                                    ChatAvatarView(
+                                        chat: summary.chat,
+                                        size: 92,
+                                        state: MausState.forChat(summary.chat, in: session.state),
+                                        animated: false
+                                    )
+                                    Text(summary.chat.name)
+                                        .font(.system(size: 15, weight: .medium))
+                                        .foregroundStyle(Color.secondary)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.75)
+                                }
+                                .frame(width: 104)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .highPriorityGesture(
+                                LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                                    presentBotActions(bot, chat: summary.chat)
+                                }
+                            )
+                            .accessibilityAction(named: "Bot actions") {
+                                presentBotActions(bot, chat: summary.chat)
+                            }
+                            .accessibilityIdentifier("chat-row.\(summary.chat.id)")
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 14)
+    }
+
+    /// Compact Home keeps the desktop's sections: pinned, groups, bots and
+    /// folders still read as groups. The attention inbox is shared by both
+    /// densities and hidden at its flag above.
+    @ViewBuilder
+    private func compactSections(_ allSummaries: [ChatSummary], waiting: Set<String>) -> some View {
+        let hasAttention = Self.showsAttentionInbox && !attention.isEmpty
+
         if let chief = session.state.unsectionedChief {
             VStack(alignment: .leading, spacing: 0) {
                 botRows(summaries(for: [chief], from: allSummaries), waiting: waiting)
             }
             // In compact, a one-line row right under the attention rows
             // would read as one more of them: set it apart like a section.
-            .padding(.top, density == .compact && !attention.isEmpty ? sectionSpacing : 0)
+            .padding(.top, hasAttention ? sectionSpacing : 0)
         }
 
         let pinned = summaries(for: session.state.pinnedBots, from: allSummaries)
         if !pinned.isEmpty {
             sectionLabel(Text("Pinned"))
-                // a compact row above it leaves little air of its own
-                .padding(.top, density == .compact ? sectionSpacing : 2)
+                .padding(.top, sectionSpacing)
                 .padding(.bottom, 4)
             botRows(pinned, waiting: waiting)
         }
 
-        switch density {
-        case .comfortable:
-            channelsStrip(
-                title: "Groups",
-                rooms: session.state.unsectionedChannels,
-                showsCreate: true
-            )
+        compactRoomsSection(
+            title: "Groups",
+            rooms: session.state.unsectionedChannels,
+            showsCreate: true,
+            waiting: waiting
+        )
 
-            if !session.state.botChats.isEmpty {
-                channelsStrip(title: "Bot threads", rooms: session.state.botChats, showsCreate: false)
-            }
-        case .compact:
-            compactRoomsSection(
-                title: "Groups",
-                rooms: session.state.unsectionedChannels,
-                showsCreate: true,
-                waiting: waiting
-            )
-
-            if !session.state.botChats.isEmpty {
-                compactRoomsSection(title: "Bot threads", rooms: session.state.botChats, showsCreate: false, waiting: waiting)
-            }
+        if !session.state.botChats.isEmpty {
+            compactRoomsSection(title: "Bot threads", rooms: session.state.botChats, showsCreate: false, waiting: waiting)
         }
 
         let unsectioned = summaries(for: session.state.unsectionedBots, from: allSummaries)
@@ -384,28 +560,13 @@ struct ChatListView: View {
 
         ForEach(session.state.sidebarSections) { section in
             VStack(alignment: .leading, spacing: 0) {
-                switch density {
-                case .comfortable:
-                    sectionLabel(Text(verbatim: section.name))
-                        .padding(.top, 18)
-                        .padding(.bottom, section.chiefs.isEmpty && !section.channels.isEmpty ? 10 : 4)
-                    if !section.chiefs.isEmpty {
-                        botRows(summaries(for: section.chiefs, from: allSummaries), waiting: waiting)
-                    }
-                    if !section.channels.isEmpty {
-                        channelTiles(section.channels, showsCreate: false)
-                            .padding(.top, section.chiefs.isEmpty ? 0 : 8)
-                            .padding(.bottom, section.bots.isEmpty ? 4 : 8)
-                    }
-                case .compact:
-                    sectionLabel(Text(verbatim: section.name))
-                        .padding(.top, sectionSpacing)
-                        .padding(.bottom, 4)
-                    if !section.chiefs.isEmpty {
-                        botRows(summaries(for: section.chiefs, from: allSummaries), waiting: waiting)
-                    }
-                    compactRoomRows(section.channels, waiting: waiting)
+                sectionLabel(Text(verbatim: section.name))
+                    .padding(.top, sectionSpacing)
+                    .padding(.bottom, 4)
+                if !section.chiefs.isEmpty {
+                    botRows(summaries(for: section.chiefs, from: allSummaries), waiting: waiting)
                 }
+                compactRoomRows(section.channels, waiting: waiting)
                 botRows(summaries(for: section.bots, from: allSummaries), waiting: waiting)
             }
         }
@@ -565,24 +726,53 @@ struct ChatListView: View {
         }
     }
 
-    /// Two lines per bot with its "Threads" beneath. As in `compactRows`,
-    /// each row and tree is Equatable on its bot's values and shown
-    /// `.equatable()`, so a publish redraws only the bots that moved.
+    /// Two lines per chat. A bot's down chevron at the end of the preview
+    /// line opens its threads in place; a running search opens the matching
+    /// threads on its own, since the search is what produced the row.
     private func comfortableRows(_ rows: [ChatSummary], waiting: Set<String>) -> some View {
-        ForEach(comfortableEntries(rows, waiting: waiting)) { entry in
+        // A new search is a new list: give the ForEach a new identity so a
+        // row kept from the previous branch (Home's full roster) is rebuilt
+        // with this search's values instead of reused with the old ones.
+        let searchKey = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ForEach(comfortableEntries(rows, waiting: waiting)) { entry in
             VStack(spacing: 0) {
                 Button {
-                    path.append(session.threadSelection.restoringThread(entry.row.chat, connectionID: session.connection?.id))
+                    openRosterRow(entry)
                 } label: {
                     entry.row.equatable()
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("chat-row.\(entry.id)")
-                if case let .bot(bot) = entry.row.chat {
-                    threadTree(bot, queued: entry.queued, held: entry.held)
+                .highPriorityGesture(
+                    LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                        if case let .bot(bot) = entry.row.chat {
+                            presentBotActions(bot, chat: entry.row.chat)
+                        }
+                    }
+                )
+                .accessibilityAction(named: "Bot actions") {
+                    if case let .bot(bot) = entry.row.chat {
+                        presentBotActions(bot, chat: entry.row.chat)
+                    }
+                }
+
+                if !entry.searchQuery.isEmpty,
+                   case let .bot(bot) = entry.row.chat {
+                    threadTree(
+                        bot,
+                        showsNewThread: entry.searchQuery.isEmpty,
+                        queued: entry.queued,
+                        held: entry.held
+                    )
                 }
             }
+            // Keep a row's identity tied to the search it was built under, so
+            // the lazy list cannot hand back the pre-search row. Expansion is
+            // deliberately not part of it: the row stays put and only the
+            // threads below it grow, which is what makes the slide smooth.
+            .id("\(entry.id)|\(entry.searchQuery)")
         }
+        .id(searchKey)
     }
 
     /// Each row worked out before the `ForEach`, so everything it shows is
@@ -595,6 +785,9 @@ struct ChatListView: View {
         let queued = state.queuedThreadIds
         // The trees' "Queued" marks read the held sends themselves.
         let held = Set(state.pendingQueued.compactMap { $0.value.isEmpty ? nil : $0.key })
+        // Read once here, on the render that builds the entries, so the row
+        // gets the current search rather than a stale one from its closure.
+        let searching = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return rows.enumerated().map { index, summary -> ComfortableEntry in
             let row = ChatRow(
                 chat: summary.chat,
@@ -605,29 +798,109 @@ struct ChatListView: View {
                 waiting: waiting.contains(summary.chat.id),
                 last: index == rows.count - 1
             )
-            return ComfortableEntry(row: row, queued: queued, held: held)
+            return ComfortableEntry(
+                row: row,
+                queued: queued,
+                held: held,
+                searchQuery: searching
+            )
         }
     }
 
-    private func threadTree(_ bot: Bot, queued: Set<String>, held: Set<String>) -> some View {
+    private func openRosterRow(_ entry: ComfortableEntry) {
+        path.append(session.threadSelection.restoringThread(
+            entry.row.chat, connectionID: session.connection?.id
+        ))
+    }
+
+    @ViewBuilder
+    private var botActionsOverlay: some View {
+        if let target = botActions {
+            BotActionsOverlay(
+                bot: target.bot,
+                chat: target.chat,
+                threads: target.bot.visibleTasks,
+                session: session,
+                onOpen: { openFromBotActions(target.chat) },
+                onOpenThread: { openFromBotActions($0) },
+                onPin: {
+                    dismissBotActions()
+                    Task { await session.setBotPinned(target.bot, pinned: target.bot.pinned != true) }
+                },
+                onSettings: {
+                    dismissBotActions()
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(180))
+                        profileBot = target.bot
+                    }
+                },
+                onNewThread: {
+                    dismissBotActions()
+                    Task {
+                        if let created = await session.createRosterThread(for: target.bot) {
+                            path.append(Chat.bot(created))
+                        }
+                    }
+                },
+                onDelete: {
+                    dismissBotActions()
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(180))
+                        botPendingDeletion = target.bot
+                    }
+                },
+                onDismiss: { dismissBotActions() }
+            )
+            .zIndex(30)
+            .transition(.opacity)
+        }
+    }
+
+    private func presentBotActions(_ bot: Bot, chat: Chat) {
+        Haptics.impact(.medium)
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+            botActions = BotActionTarget(bot: bot, chat: chat)
+        }
+    }
+
+    private func dismissBotActions() {
+        withAnimation(.easeOut(duration: 0.16)) { botActions = nil }
+    }
+
+    private func openFromBotActions(_ chat: Chat) {
+        dismissBotActions()
+        Task {
+            try? await Task.sleep(for: .milliseconds(160))
+            path.append(chat)
+        }
+    }
+
+    private func botId(_ chat: Chat) -> String {
+        if case let .bot(bot) = chat { return bot.id }
+        return chat.id
+    }
+
+    private func threadTree(
+        _ bot: Bot, showsNewThread: Bool, queued: Set<String>, held: Set<String>
+    ) -> some View {
         BotThreadTree(
             bot: bot,
             query: $query,
-            expandedBots: $expandedBots,
-            collapsedFolders: $collapsedFolders,
+            showsNewThread: showsNewThread,
             creatingThreads: $creatingThreads,
             queuedThreadIds: queued,
             heldThreadIds: held,
             session: session,
-            open: { chat in path.append(chat) },
-            manage: { chat in managingThreads = chat }
+            open: { chat in path.append(chat) }
         )
         .equatable()
     }
 
     // MARK: - Bottom bar
 
+    @ViewBuilder
     private func bottomBar(updates: [ChatUpdate]) -> some View {
+        if searchOpen || updatesPill {
         GlassGroup(spacing: 8) {
             HStack(spacing: 8) {
                 if searchOpen {
@@ -664,9 +937,11 @@ struct ChatListView: View {
                     .frame(height: 52)
                     .glassCapsule()
                 } else {
-                    ViewThatFits(in: .horizontal) {
-                        expandedBottomActions(updates: updates)
-                        compactBottomActions(updates: updates)
+                    HStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        updatesButton(updates: updates)
+                            .frame(width: 250)
+                        Spacer(minLength: 0)
                     }
                 }
             }
@@ -674,45 +949,6 @@ struct ChatListView: View {
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
         .animation(.snappy(duration: 0.25), value: searchOpen)
-    }
-
-    private func expandedBottomActions(updates: [ChatUpdate]) -> some View {
-        HStack(spacing: 8) {
-            updatesButton(updates: updates)
-                .frame(width: 180)
-            searchButton
-            walkieButton
-            if session.canAdminister {
-                sectionButton
-                newBotButton
-            }
-        }
-    }
-
-    private func compactBottomActions(updates: [ChatUpdate]) -> some View {
-        HStack(spacing: 8) {
-            updatesButton(updates: updates)
-                .frame(minWidth: 148)
-            searchButton
-            walkieButton
-            // Creating bots and sections needs the admin scope on a server;
-            // a chat-only phone is not shown buttons the server would refuse.
-            if session.canAdminister {
-                Menu {
-                    Button("New section", systemImage: "folder.badge.plus", action: openNewSection)
-                        .disabled(!hasVisibleBots)
-                    Button("New bot", systemImage: "square.and.pencil", action: createBot)
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 20, weight: .medium))
-                        .foregroundStyle(Color.primary)
-                        .frame(width: 48, height: 48)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .glassCapsule()
-                .accessibilityLabel("Create")
-            }
         }
     }
 
@@ -724,35 +960,33 @@ struct ChatListView: View {
         .frame(height: 52)
     }
 
-    private var searchButton: some View {
-        GlassButton(systemImage: "magnifyingglass", size: 48, weight: .semibold) {
-            Haptics.selection()
-            searchOpen = true
-            searchFocused = true
+    /// The account menu, top left beside the wordless header: the same round
+    /// glass control as search and create.
+    private var accountButton: some View {
+        Menu {
+            if !updatesPill {
+                Button { showingUpdates = true } label: {
+                    Label("Updates", systemImage: "tray.full")
+                }
+            }
+            Button { showingSettings = true } label: {
+                Label("Settings", systemImage: "gearshape")
+            }
+            Button { showingCalendar = true } label: {
+                Label("Routine calendar", systemImage: "calendar")
+            }
+        } label: {
+            Image(systemName: "person")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(Color.primary)
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
         }
-        .accessibilityLabel("Search")
-    }
-
-    /// Walkie: hold-to-talk with every agent's state at a glance.
-    private var walkieButton: some View {
-        GlassButton(systemImage: "waveform", size: 48, weight: .semibold) {
-            Haptics.selection()
-            showingWalkie = true
-        }
-        .accessibilityLabel("Walkie")
-        .disabled(liveCall.machine.isActive)
-    }
-
-    private var sectionButton: some View {
-        GlassButton(systemImage: "folder.badge.plus", size: 48, weight: .medium, action: openNewSection)
-            .disabled(!hasVisibleBots)
-            .opacity(hasVisibleBots ? 1 : 0.45)
-            .accessibilityLabel("New section")
-    }
-
-    private var newBotButton: some View {
-        GlassButton(systemImage: "square.and.pencil", size: 48, weight: .medium, action: createBot)
-            .accessibilityLabel("New bot")
+        .glassCapsule()
+        .accessibilityLabel(session.connection.map { LocalizedStringKey("Connected to \($0.name)") }
+            ?? "Account")
+        .accessibilityHint("Settings and the routine calendar")
+        .accessibilityIdentifier("account")
     }
 
     private var hasVisibleBots: Bool {
@@ -778,8 +1012,9 @@ struct ChatListView: View {
     /// The reader's activity level, which the roster preview folds by.
     private var activity: ActivityDetail { ActivityDetail(rawValue: activityDetail) ?? .phoneDefault }
 
-    /// How much each row says, from Settings.
-    private var density: RosterDensity { RosterDensity(stored: rosterDensity) }
+    /// The roster is always the comfortable, two-line layout; compact was
+    /// removed with its Settings choice.
+    private var density: RosterDensity { .comfortable }
 
     private var chats: [ChatSummary] {
         let all = rosterSummaries(previews: true)
@@ -865,6 +1100,24 @@ struct ChatListView: View {
     }
 }
 
+extension View {
+    /// Places the floating roster bar. On iOS 26 a safe area bar hands the
+    /// system the bottom edge, so the list fades and blurs beneath it; older
+    /// systems keep the plain safe-area inset.
+    @ViewBuilder
+    func rosterBottomBar<Bar: View>(visible: Bool = true, @ViewBuilder bar: () -> Bar) -> some View {
+        if visible {
+            if #available(iOS 26.0, *) {
+                safeAreaBar(edge: .bottom, spacing: 0, content: bar)
+            } else {
+                safeAreaInset(edge: .bottom, spacing: 0, content: bar)
+            }
+        } else {
+            self
+        }
+    }
+}
+
 // MARK: - Rows and tiles
 
 /// One comfortable row as the list worked it out: the row, and what its
@@ -874,6 +1127,10 @@ private struct ComfortableEntry: Identifiable, Equatable {
     let row: ChatRow
     let queued: Set<String>
     let held: Set<String>
+    /// The roster search this entry was built under. Part of the data so a
+    /// row re-renders as the query narrows, and so the tree it may show is
+    /// filtered by the current text rather than the row's creation time.
+    let searchQuery: String
 
     var id: String { row.chat.id }
 }
@@ -1029,7 +1286,8 @@ struct ChatRow: View, Equatable {
     /// draws the whole bot or room, so it compares those.
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.preview == rhs.preview && lhs.at == rhs.at && lhs.today == rhs.today && lhs.state == rhs.state
-            && lhs.waiting == rhs.waiting && lhs.last == rhs.last && sameContent(lhs.chat, rhs.chat)
+            && lhs.waiting == rhs.waiting && lhs.last == rhs.last
+            && sameContent(lhs.chat, rhs.chat)
     }
 
     private static func sameContent(_ lhs: Chat, _ rhs: Chat) -> Bool {
@@ -1050,10 +1308,10 @@ struct ChatRow: View, Equatable {
                         .frame(width: 10, height: 10)
                 }
             }
-            .frame(width: 22)
+            .frame(width: 18)
             .frame(maxHeight: .infinity)
 
-            HStack(alignment: .top, spacing: 14) {
+            HStack(alignment: .top, spacing: 10) {
                 ChatAvatarView(chat: chat, size: 52, state: state, animated: state.showsActivity)
                     .padding(.top, 12)
 
@@ -1082,12 +1340,9 @@ struct ChatRow: View, Equatable {
                             .font(.system(size: 15))
                             .foregroundStyle(Color.secondary)
                             .fixedSize()
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Color.secondary.opacity(0.5))
                     }
 
-                    HStack(alignment: .top, spacing: 8) {
+                    HStack(alignment: .center, spacing: 6) {
                         // one line for every bot, so the rows keep one rhythm
                         Text(preview.isEmpty ? " " : preview)
                             .font(.system(size: 15))
@@ -1097,7 +1352,7 @@ struct ChatRow: View, Equatable {
                         Spacer(minLength: 0)
 
                         if chat.busy {
-                            ProgressView().controlSize(.mini).padding(.top, 3)
+                            ProgressView().controlSize(.mini)
                         }
                     }
 
@@ -1119,7 +1374,7 @@ struct ChatRow: View, Equatable {
             }
             .padding(.trailing, 16)
         }
-        .padding(.leading, 6)
+        .padding(.leading, 4)
         .contentShape(Rectangle())
     }
 }
@@ -1156,11 +1411,15 @@ struct UpdatesPill: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(updates.isEmpty ? Color.secondary : Color.primary)
                     .lineLimit(1)
+                    // The bar is deliberately narrow; shrink a long bot name
+                    // rather than cutting the sentence to "…".
+                    .minimumScaleFactor(0.85)
 
                     Text(subline)
                         .font(.system(size: 12))
                         .foregroundStyle(Color.secondary)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.9)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.up")
@@ -1197,7 +1456,6 @@ struct MascotStack: View {
             ForEach(Array(colors.enumerated()), id: \.offset) { _, color in
                 MausAvatar(color: color, size: size, state: .idle, animated: false)
                     .padding(2)
-                    .background(Circle().fill(Color(uiColor: .systemBackground)))
             }
         }
     }
@@ -1208,29 +1466,65 @@ struct StatusBanner: View {
     @EnvironmentObject private var session: Session
 
     var body: some View {
-        Group {
-            switch session.status {
-            case .live, .unpaired:
-                EmptyView()
-            case .connecting:
-                banner("Connecting…", systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
-            case let .offline(reason):
-                banner(reason, systemImage: "wifi.slash", tint: .orange)
-            case .unauthorized:
-                banner("This device was unpaired on the computer.", systemImage: "lock.slash", tint: .red)
-            }
-        }
-        .animation(.default, value: session.status)
+        stateBanner
+            .animation(.default, value: session.status)
     }
 
-    private func banner(_ text: String, systemImage: String, tint: Color) -> some View {
-        Label(text, systemImage: systemImage)
-            .font(.footnote)
-            .foregroundStyle(tint)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .glassCapsule(interactive: false)
-            .padding(.bottom, 8)
+    @ViewBuilder
+    private var stateBanner: some View {
+        switch session.status {
+        case .live, .unpaired:
+            EmptyView()
+        case .connecting:
+            // The roster header carries this as a small inline spinner and
+            // label; a full-width banner would say the same thing louder.
+            EmptyView()
+        case .offline:
+            // The empty roster shows one small failure mark in the middle;
+            // the banner would say the same thing louder.
+            EmptyView()
+        case .unauthorized:
+            banner("This device was unpaired on the computer.", systemImage: "lock.slash", tint: .red)
+        }
+    }
+
+    private func banner(
+        _ text: String, systemImage: String, tint: Color, canRetry: Bool = false
+    ) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(tint.opacity(0.16)))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(text)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color.primary.opacity(0.9))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if canRetry {
+                    Button("Try again") {
+                        Task { await session.refresh() }
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(tint)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(tint.opacity(0.22), lineWidth: 0.5)
+        )
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
     }
 }
 
@@ -1292,4 +1586,11 @@ enum RelativeStamp {
         if calendar.isDateInYesterday(date) { return "Yesterday \(time)" }
         return "\(date.formatted(.dateTime.day().month(.abbreviated))) \(time)"
     }
+}
+
+/// The bot whose long-press surface is up, and the thread it should open.
+private struct BotActionTarget: Identifiable {
+    let bot: Bot
+    let chat: Chat
+    var id: String { chat.conversationID }
 }

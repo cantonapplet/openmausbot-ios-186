@@ -31,8 +31,8 @@ struct DigestSheet: View {
             .navigationTitle("What I did")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+                ToolbarItem(placement: .topBarLeading) {
+                    CloseButton()
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button("Copy", systemImage: "doc.on.doc") {

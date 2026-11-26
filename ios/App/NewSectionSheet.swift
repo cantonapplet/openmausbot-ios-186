@@ -98,9 +98,8 @@ struct NewSectionSheet: View {
             .navigationTitle(step == .bots ? "New section" : "Name section")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(lastCreatedName == nil ? "Cancel" : "Done") { dismiss() }
-                        .disabled(saving)
+                ToolbarItem(placement: .topBarLeading) {
+                    CloseButton().disabled(saving)
                 }
             }
             .interactiveDismissDisabled(saving)
@@ -222,7 +221,7 @@ struct NewSectionSheet: View {
             .padding(.horizontal, 16)
             .padding(.top, 10)
             .padding(.bottom, 6)
-            .background(.ultraThinMaterial)
+            .chromeBar()
         }
     }
 
@@ -544,7 +543,7 @@ struct NewSectionSheet: View {
             .padding(.horizontal, 16)
             .padding(.top, 10)
             .padding(.bottom, 6)
-            .background(.ultraThinMaterial)
+            .chromeBar()
         }
         .onAppear { nameFocused = true }
     }
@@ -603,7 +602,7 @@ struct NewSectionSheet: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("\(name) is ready")
                     .font(.system(size: 14, weight: .semibold))
-                Text("Swipe another section together, or tap Done.")
+                Text("Swipe another section together, or close this sheet.")
                     .font(.system(size: 12))
                     .foregroundStyle(Color.secondary)
             }

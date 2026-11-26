@@ -53,8 +53,8 @@ struct RoutineCalendarView: View {
             .navigationTitle(Text(selected, format: .dateTime.month(.wide).year()))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+                ToolbarItem(placement: .topBarLeading) {
+                    CloseButton()
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
                     if !calendar.isDateInToday(selected) {

@@ -1,6 +1,15 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%@ active" : {
+
+    },
+    "%@ need you" : {
+
+    },
+    "%@ working" : {
+
+    },
     "%lld active" : {
       "extractionState" : "manual"
     },
@@ -34,10 +43,10 @@
     "Everything the Updates pill shows, with the chats that need you first." : {
       "extractionState" : "manual"
     },
-    "Needs You" : {
+    "Needs you" : {
       "extractionState" : "manual"
     },
-    "Needs you" : {
+    "Needs You" : {
       "extractionState" : "manual"
     },
     "Nothing working" : {

@@ -1,12 +1,28 @@
 import CompanionCore
 import PhotosUI
 import SwiftUI
+import UIKit
+
+/// A chat action offered from inside the bot's settings page. Tapping the
+/// bot's face opens settings; these three used to be buttons beside it.
+enum AgentProfileAction {
+    case threads
+    case computer
+    case browser
+    case liveCall
+}
+
 
 /// The paired-safe subset of bot settings. Shared provider keys remain on the
 /// computer; the phone sees only the model catalog, configured/not-configured
 /// status, and renderer-neutral profile operations.
 struct AgentProfileView: View {
     let bot: Bot
+    /// Set by the chat that pushes this page: the page pops and the chat
+    /// performs the chosen action.
+    var onAction: ((AgentProfileAction) -> Void)?
+    /// Whether the chat may start a Live call right now.
+    var canStartCall = false
 
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
@@ -19,6 +35,7 @@ struct AgentProfileView: View {
     @State private var speakReplies: Bool
     @State private var photo: PhotosPickerItem?
     @State private var prompt = ""
+    @State private var showGenerator = false
     @State private var voices: [Voice] = []
     @State private var config: ConfigStatus?
     @State private var engine: VoiceProvider = .elevenlabs
@@ -37,10 +54,21 @@ struct AgentProfileView: View {
     @State private var busy = false
     @StateObject private var player = VoiceNotePlayer()
     @State private var previewTask: Task<Void, Never>?
+    @State private var autosaveTask: Task<Void, Never>?
     @State private var baseline: ProfileFormSnapshot
+    @State private var confirmingDelete = false
+    @State private var deleting = false
+    @State private var showingEditPage = false
+    @AppStorage(PrefKey.screenTarget) private var screenTargetRaw = ScreenTarget.browser.rawValue
 
-    init(bot: Bot) {
+    init(
+        bot: Bot,
+        onAction: ((AgentProfileAction) -> Void)? = nil,
+        canStartCall: Bool = false
+    ) {
         self.bot = bot
+        self.onAction = onAction
+        self.canStartCall = canStartCall
         _name = State(initialValue: bot.name)
         _title = State(initialValue: bot.title)
         _description = State(initialValue: bot.description)
@@ -56,6 +84,9 @@ struct AgentProfileView: View {
     }
 
     private var current: Bot { session.state.bot(bot.id)?.projected(forThread: bot.threadId) ?? bot }
+    private var screenTarget: ScreenTarget {
+        ScreenTarget(rawValue: screenTargetRaw) ?? .browser
+    }
     private var imageGenerationReady: Bool { config?.imageGen?.configured == true }
     private var voiceConfigured: Bool { config?.isTTSConfigured == true }
     private var hasWorkspaceDefaultVoice: Bool { config?.hasWorkspaceDefaultVoice == true }
@@ -110,6 +141,16 @@ struct AgentProfileView: View {
         let effortIsOffered = selectedEffort.map(effortLevels.contains) ?? true
         return modelIsOffered && effortIsOffered && modelDraft != savedModel
     }
+    /// The fields autosave watches.
+    private var hasUnsavedChanges: Bool {
+        name != baseline.name
+            || title != baseline.title
+            || description != baseline.description
+            || notifications != baseline.notifications
+            || crop != baseline.crop
+            || voice != baseline.voice
+            || speakReplies != baseline.speakReplies
+    }
     /// Which engine's words to use. An unloaded status is ElevenLabs for the
     /// same reason a missing `provider` is: that is the server's own fallback,
     /// and the copy that shipped.
@@ -118,46 +159,164 @@ struct AgentProfileView: View {
     private var usesFishAudio: Bool { config?.voiceProvider == .fish }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                // Changing the model and generating avatars need the admin scope
-                // on a server; a chat-only phone is not shown either.
-                if session.canAdminister {
-                    modelSection
+        Form {
+            Section {
+                profileIdentity
+                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 0, trailing: 16))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+            if onAction != nil {
+                chatActionsSection
+            }
+            // Changing the model needs the admin scope on a server; a
+            // chat-only phone is not shown either.
+            if session.canAdminister {
+                modelSection
+            }
+            voiceSection
+            moreSection
+            deleteSection
+        }
+        .scrollContentBackground(.hidden)
+        .compactSectionSpacing()
+        .background(Color.appGroupedBackground)
+        .navigationBarTitleDisplayMode(.inline)
+        // Pushed from a chat/roster that hides its bar, so opt this page back
+        // into the system back button.
+        .toolbar(.visible, for: .navigationBar)
+        .toolbar { profileToolbar }
+        .accessibilityIdentifier("bot-settings-page")
+        // Auto-saving: every field writes through as it changes, so the page
+        // carries no Save button and a stray back swipe loses nothing.
+        .onValueChange(of: name) { _ in autosave() }
+        .onValueChange(of: title) { _ in autosave() }
+        .onValueChange(of: description) { _ in autosave() }
+        .onValueChange(of: notifications) { _ in autosave() }
+        .onValueChange(of: crop) { _ in autosave() }
+        .onValueChange(of: voice) { _ in autosave() }
+        .onValueChange(of: speakReplies) { _ in autosave() }
+        .overlay { if busy { ProgressView().controlSize(.large) } }
+        .task { await loadProfile() }
+        .navigationDestination(isPresented: $showingEditPage) { editPage }
+        .confirmationDialog(
+            Text("Delete \(current.name)?"),
+            isPresented: $confirmingDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete bot", role: .destructive) {
+                deleting = true
+                Task {
+                    let removed = await session.deleteBot(current)
+                    deleting = false
+                    if removed { dismiss() }
                 }
-                avatarSection
-                if session.canAdminister {
-                    generateSection
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the bot and its threads from your computer. It cannot be undone.")
+        }
+        .onValueChange(of: photo) { item in
+            guard let item else { return }
+            Task { await upload(item) }
+        }
+        .onValueChange(of: engine) { selected in
+            Task { await switchEngine(to: selected) }
+        }
+        .onValueChange(of: player.isPlaying) { playing in
+            if !playing { VoiceNoteCenter.shared.release(player) }
+        }
+        .onDisappear {
+            previewTask?.cancel()
+            player.pause()
+            VoiceNoteCenter.shared.release(player)
+            if hasUnsavedChanges { Task { await save() } }
+        }
+    }
+
+    /// Writes the form back without a Save button: keystrokes coalesce into
+    /// one patch, switches and pickers commit the moment they change. Quiet
+    /// on purpose — no spinner for a write the reader never started.
+    private func autosave() {
+        guard hasUnsavedChanges, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        autosaveTask?.cancel()
+        autosaveTask = Task {
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            await save()
+        }
+    }
+
+    /// Threads beside the system back button, both in the toolbar's own
+    /// Liquid Glass. Nothing here draws a background: the bar supplies it.
+    @ToolbarContentBuilder
+    private var profileToolbar: some ToolbarContent {
+        if onAction != nil {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    onAction?(.threads)
+                } label: {
+                    Image(systemName: "square.stack")
                 }
-                identitySection
-                voiceSection
-                Section {
-                    Button("Save profile changes") { Task { await save() } }
-                        .disabled(busy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityLabel("Threads")
+            }
+        }
+    }
+
+    private var chatActionsSection: some View {
+        Section {
+            // The whole panel is the target, not just the button inside it.
+            Button {
+                onAction?(screenTarget == .browser ? .browser : .computer)
+            } label: {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(Color.black.opacity(0.45))
+
+                    Text("View screen")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Color.black)
+                        .frame(width: 190, height: 44)
+                        .background(
+                            Color.white,
+                            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        )
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 150)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("View screen")
+            .accessibilityHint("Opens the selected browser or computer")
+            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 8, trailing: 0))
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+        } header: {
+            Menu {
+                Button {
+                    screenTargetRaw = ScreenTarget.browser.rawValue
+                } label: {
+                    Label("Browser", systemImage: "globe")
+                }
+                Button {
+                    screenTargetRaw = ScreenTarget.computer.rawValue
+                } label: {
+                    Label("Computer", systemImage: "display")
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(screenTarget.title)
+                        .font(.headline)
+                        .foregroundStyle(Color.secondary)
+                        .textCase(nil)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.secondary)
                 }
             }
-            .navigationTitle("Bot settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-            }
-            .overlay { if busy { ProgressView().controlSize(.large) } }
-            .task { await loadProfile() }
-            .onValueChange(of: photo) { item in
-                guard let item else { return }
-                Task { await upload(item) }
-            }
-            .onValueChange(of: engine) { selected in
-                Task { await switchEngine(to: selected) }
-            }
-            .onValueChange(of: player.isPlaying) { playing in
-                if !playing { VoiceNoteCenter.shared.release(player) }
-            }
-            .onDisappear {
-                previewTask?.cancel()
-                player.pause()
-                VoiceNoteCenter.shared.release(player)
-            }
+            .accessibilityLabel("Screen source")
+            .accessibilityValue(screenTarget.title)
         }
     }
 
@@ -170,7 +329,7 @@ struct AgentProfileView: View {
                     ProgressView()
                 }
             } else if instanceChoices.isEmpty {
-                Label("No model providers are available", systemImage: "exclamationmark.triangle")
+                Text("No model providers are available")
                     .foregroundStyle(.secondary)
             } else {
                 modelPickers
@@ -216,26 +375,58 @@ struct AgentProfileView: View {
         }
 
         if current.busy == true {
-            Label("Stop this bot before changing its model.", systemImage: "hourglass")
+            Text("Stop this bot before changing its model.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         } else if selectedInstance?.snapshot.isAvailable != true {
-            Label("Choose an available provider to change this bot's model.", systemImage: "info.circle")
+            Text("Choose an available provider to change this bot's model.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
 
-        Button("Apply model", systemImage: "checkmark") {
+        Button("Apply model") {
             Task { await saveModel() }
         }
         .disabled(busy || !canApplyModel)
     }
 
-    private var avatarSection: some View {
+    /// The identity card: face, name and role stacked on top of one another
+    /// and centred, larger than the roster row this replaced. The card opens
+    /// the edit page.
+    private var profileIdentity: some View {
+        // A button, not a NavigationLink: the form would draw a disclosure
+        // chevron beside the centred face, which reads as a stray arrow.
+        Button {
+            showingEditPage = true
+        } label: {
+            VStack(spacing: 14) {
+                BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
+                Text(current.name)
+                    .font(.largeTitle.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+                if !current.title.isEmpty {
+                    Text(current.title)
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 20)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(current.name) details")
+        .accessibilityHint("Change the name, title and photo")
+        .accessibilityIdentifier("edit-bot-profile")
+    }
+
+    private var appearanceSection: some View {
         Section {
             HStack {
                 Spacer()
-                BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
+                BotAvatarView(bot: current, size: 96, state: .happy, animated: true)
                 Spacer()
             }
             .listRowBackground(Color.clear)
@@ -248,63 +439,123 @@ struct AgentProfileView: View {
             .pickerStyle(.segmented)
 
             PhotosPicker(selection: $photo, matching: .images) {
-                Label("Upload image", systemImage: "photo.badge.plus")
+                Text("Upload an image")
             }
             .disabled(busy)
 
             if current.avatarUrl != nil {
-                Button("Use mascot", systemImage: "trash", role: .destructive) {
+                Button("Use the mascot instead", role: .destructive) {
                     Task { await clearImage() }
                 }
                 .disabled(busy)
             }
-        } header: {
-            Text("Avatar")
-        } footer: {
-            Text("PNG, JPEG, GIF, or WebP, up to 10 MB. Images are stored on your paired computer and loaded with this device's pairing token.")
-        }
-    }
 
-    private var generateSection: some View {
-        Section {
-            TextField("Art direction", text: $prompt, axis: .vertical)
-                .lineLimit(2...5)
-            Button("Generate on computer", systemImage: "sparkles") {
-                Task { await generateImage() }
+            if session.canAdminister {
+                DisclosureGroup(isExpanded: $showGenerator) {
+                    TextField("Describe the image you want", text: $prompt, axis: .vertical)
+                        .lineLimit(2...5)
+                    Button("Generate on your computer") {
+                        Task { await generateImage() }
+                    }
+                    .disabled(busy || !imageGenerationReady || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Text(imageGenerationReady
+                         ? "Uses the shared image provider configured on your computer. No key is sent to this phone."
+                         : "Set up the shared image provider in OpenMausBot on your computer to generate one.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } label: {
+                    Text("Generate an image")
+                }
             }
-            .disabled(busy || !imageGenerationReady || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } header: {
-            Text("Generate an avatar")
+            Text("Appearance")
         } footer: {
-            Text(imageGenerationReady
-                 ? "Generation uses the shared image provider configured on your computer. No provider key is sent to or stored on this device."
-                 : "To generate images, configure the shared image provider in OpenMausBot on your computer. Provider keys cannot be added from this device.")
+            Text("PNG, JPEG, GIF, or WebP, up to 10 MB. The image stays on your paired computer.")
         }
     }
 
-    private var identitySection: some View {
-        Section("Identity") {
+    private var editPage: some View {
+        Form {
+            aboutSection
+            alertsSection
+            appearanceSection
+        }
+        .scrollContentBackground(.hidden)
+        .background(Color.appGroupedBackground)
+        .navigationTitle("Edit bot")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var aboutSection: some View {
+        Section {
+            LabeledContent("Name") {
+                TextField("Pepper", text: $name)
+                    .multilineTextAlignment(.trailing)
+                    .textInputAutocapitalization(.words)
+            }
+            LabeledContent("Title") {
+                TextField("Personal assistant", text: $title)
+                    .multilineTextAlignment(.trailing)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Description")
+                    .foregroundStyle(.secondary)
+                TextField("What this agent does", text: $description, axis: .vertical)
+                    .lineLimit(2...6)
+            }
+        } header: {
+            Text("About")
+        } footer: {
+            Text("Name and title appear in the roster. The description tells the bot how to introduce itself.")
+        }
+    }
+
+    private var alertsSection: some View {
+        Section {
+            Toggle("Notifications", isOn: $notifications)
+        } header: {
+            Text("Alerts")
+        } footer: {
+            Text("Announcements for this bot on this phone.")
+        }
+    }
+
+    private var moreSection: some View {
+        Section("Details") {
             NavigationLink {
                 BotOverviewView(bot: current)
             } label: {
-                Label("What this bot does", systemImage: "list.bullet.rectangle")
+                Text("What this bot does")
             }
             NavigationLink {
                 BotActivityView(bot: current)
             } label: {
-                Label("Activity", systemImage: "checklist")
+                Text("Activity")
             }
             NavigationLink {
                 TeamMemoryView(section: current.section ?? "")
             } label: {
-                Label("Team memory", systemImage: "brain")
+                Text("Team memory")
             }
-            TextField("Name", text: $name)
-                .textInputAutocapitalization(.words)
-            TextField("Title", text: $title)
-            TextField("What this agent does", text: $description, axis: .vertical)
-                .lineLimit(3...8)
-            Toggle("Agent notifications", isOn: $notifications)
+        }
+    }
+
+    private var deleteSection: some View {
+        Section {
+            Button(role: .destructive) {
+                confirmingDelete = true
+            } label: {
+                if deleting {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                } else {
+                    Text("Delete bot")
+                        .foregroundStyle(Color.red)
+                }
+            }
+            .disabled(deleting)
+        } footer: {
+            Text("Deleting this bot also removes its threads from your computer.")
         }
     }
 
@@ -327,13 +578,10 @@ struct AgentProfileView: View {
             if voiceConfigured {
                 voiceControls
             } else if usesSystemVoices {
-                Label("Built-in Mac voices are unavailable", systemImage: "speaker.slash")
+                Text("Built-in Mac voices are unavailable")
                     .foregroundStyle(.secondary)
             } else if !usesChatterbox {
-                Label(
-                    usesFishAudio ? "Fish Audio is not configured" : "ElevenLabs is not configured",
-                    systemImage: "speaker.slash"
-                )
+                Text(usesFishAudio ? "Fish Audio is not configured" : "ElevenLabs is not configured")
                     .foregroundStyle(.secondary)
             }
         } header: {
@@ -369,7 +617,7 @@ struct AgentProfileView: View {
         }
         .disabled(savingServer || chatterboxURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         if let serverProblem {
-            Label(serverProblem, systemImage: "exclamationmark.triangle")
+            Text(serverProblem)
                 .foregroundStyle(Color.orange)
         }
     }
@@ -394,13 +642,13 @@ struct AgentProfileView: View {
         }
         Toggle("Speak replies", isOn: $speakReplies)
             .disabled(!selectedVoiceCanSpeak)
-        Button("Preview voice", systemImage: "speaker.wave.2") {
+        Button("Preview voice") {
             previewTask = Task { await previewVoice() }
         }
         .disabled(busy || !selectedVoiceCanSpeak)
 
         if !hasWorkspaceDefaultVoice, voice.isEmpty {
-            Label("Pick a voice for this agent before enabling speech.", systemImage: "info.circle")
+            Text("Pick a voice for this agent before enabling speech.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -523,11 +771,10 @@ struct AgentProfileView: View {
     }
 
     private func save() async {
-        busy = true
+        guard hasUnsavedChanges, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if let updated = await session.updateProfile(profilePatch(), for: current) {
             synchronizeForm(with: updated)
         }
-        busy = false
     }
 
     /// The provider list is admin-only on a server: asking without the
@@ -742,6 +989,23 @@ private extension AvatarCrop {
         case .circle: "Circle"
         case .rounded: "Rounded"
         case .square: "Square"
+        }
+    }
+}
+
+private extension View {
+    /// Tighter gaps between form sections on iOS 17+; iOS 16 keeps the
+    /// system spacing this screen shipped with.
+    @ViewBuilder
+    func compactSectionSpacing() -> some View {
+        if #available(iOS 17.0, *) {
+            listSectionSpacing(.compact)
+                // The form's own top inset is what felt like padding above
+                // the identity row; trim it without pulling the row out of
+                // its cell (negative row insets clip the avatar).
+                .contentMargins(.top, 4, for: .scrollContent)
+        } else {
+            self
         }
     }
 }

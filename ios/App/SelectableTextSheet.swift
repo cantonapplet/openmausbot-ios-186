@@ -27,8 +27,8 @@ struct SelectableTextSheet: View {
             .navigationTitle("Select Text")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+                ToolbarItem(placement: .topBarLeading) {
+                    CloseButton()
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button {

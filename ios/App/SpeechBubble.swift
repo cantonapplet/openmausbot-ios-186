@@ -88,9 +88,20 @@ struct SpeechBubble: Shape {
 /// The two bubble fills. Solid rather than translucent on purpose: the tail
 /// is part of the same fill, and a see-through bubble shows the seam.
 enum BubbleColor {
-    /// What you said. The mascot palette's blue, not the system's.
+    /// The send arrow's blue, not the system accent.
     static let mine = MausPalette.color("blue")
     static let mineText = Color.white
+
+    /// What you said: the colour of the bot this thread belongs to.
+    static func mine(for botColor: String) -> Color {
+        MausPalette.color(botColor)
+    }
+
+    /// Type on that fill: white on the darker avatars, near-black on the
+    /// light ones (yellow, orange) so it stays readable.
+    static func mineText(for botColor: String) -> Color {
+        MausPalette.isLight(botColor) ? Color(hex: "#1C1C1E") : .white
+    }
 
     /// What a bot said. Near-black on dark, a soft grey on light.
     static let theirs = Color(uiColor: UIColor { trait in

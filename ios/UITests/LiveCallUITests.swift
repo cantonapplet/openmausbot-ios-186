@@ -7,6 +7,60 @@ import XCTest
 
 final class LiveCallUITests: XCTestCase {
     @MainActor
+    func testEditOpensAboutAndAppearanceOnTheirOwnPage() {
+        let app = launch()
+        openGmail(app)
+        XCTAssertTrue(app.openChatActions(), "bot settings opens from the face")
+        let edit = app.buttons["edit-bot-profile"]
+        XCTAssertTrue(edit.waitForExistence(timeout: 5), "Edit in the bot header")
+        edit.tap()
+        XCTAssertTrue(app.staticTexts["Edit bot"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["About"].exists)
+        XCTAssertTrue(app.staticTexts["Appearance"].exists)
+        XCTAssertTrue(app.staticTexts["Name"].exists)
+        record("Bot settings edit page", app)
+    }
+
+    @MainActor
+    func testBotSettingsOffersChatActions() {
+        let app = launch()
+        openGmail(app)
+        XCTAssertTrue(app.openChatActions(), "bot settings opens from the face")
+        XCTAssertTrue(app.botSettingsPage.exists, "bot settings is up")
+        XCTAssertTrue(app.buttons["Threads"].exists)
+        XCTAssertTrue(app.buttons["View screen"].exists)
+        XCTAssertTrue(app.buttons["Screen source"].exists)
+        record("Bot settings chat actions", app)
+    }
+    /// The screen source in bot settings is the header's screen button: pick
+    /// the computer there, and the globe becomes a display that opens it.
+    @MainActor
+    func testScreenChoiceIsSharedWithTheChatHeader() {
+        let app = launch()
+        openGmail(app)
+        XCTAssertTrue(app.openChatActions(), "bot settings opens from the face")
+        let source = app.buttons["Screen source"]
+        XCTAssertTrue(source.waitForExistence(timeout: 5))
+        source.tap()
+        let computer = app.buttons["Computer"]
+        XCTAssertTrue(computer.waitForExistence(timeout: 5), "the source menu offers the computer")
+        computer.tap()
+
+        // Leave settings the way a person would, then read the header again.
+        let back = app.navigationBars.buttons.firstMatch
+        XCTAssertTrue(back.waitForExistence(timeout: 5))
+        back.tap()
+        let header = app.buttons["header-bot-actions"]
+        XCTAssertTrue(header.waitForExistence(timeout: 5))
+        let screen = app.buttons["Computer"]
+        XCTAssertTrue(screen.waitForExistence(timeout: 5), "the header follows the shared choice")
+
+        screen.tap()
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10), "the computer opens full screen")
+        record("Computer from the header", app)
+    }
+
+    @MainActor
     func testACallStartsFromTheHeaderAndEndsFromTheBar() {
         let app = launch()
         openGmail(app)
@@ -16,9 +70,7 @@ final class LiveCallUITests: XCTestCase {
         XCTAssertTrue(scrollUp(to: viaCall, app: app), "the via-call label never appeared")
         record("Via call label", app)
 
-        let start = app.buttons["live-call-start"]
-        XCTAssertTrue(start.waitForExistence(timeout: 5))
-        start.tap()
+        startCall(app)
 
         let bar = app.otherElements["live-call-bar"]
         XCTAssertTrue(bar.waitForExistence(timeout: 5))
@@ -36,7 +88,7 @@ final class LiveCallUITests: XCTestCase {
 
         // The composer's microphone is not available during a call.
         XCTAssertFalse(app.buttons["Start dictation"].isEnabled)
-        XCTAssertFalse(start.exists, "no second call from the header while one runs")
+        XCTAssertFalse(app.chatCanStartCall(), "no second call from the header while one runs")
 
         let mute = app.buttons["live-call-mute"]
         XCTAssertEqual(mute.label, "Mute")
@@ -51,12 +103,12 @@ final class LiveCallUITests: XCTestCase {
         XCTAssertTrue(Self.text(Self.disclosure, in: app).exists, "the sheet says what a call sends to OpenAI")
         XCTAssertTrue(app.staticTexts[Self.typedRepliesOff].exists, "the switch says what off keeps from OpenAI")
         record("Live call settings", app)
-        app.buttons["Done"].tap()
+        app.buttons["Close"].tap()
 
         app.buttons["live-call-hangup"].tap()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: bar)
         waitForExpectations(timeout: 10)
-        XCTAssertTrue(start.waitForExistence(timeout: 5), "the header offers a new call once the bar is gone")
+        XCTAssertTrue(app.chatCanStartCall(), "the header offers a new call once the bar is gone")
         XCTAssertTrue(app.buttons["Start dictation"].isEnabled)
         record("After hang up", app)
     }
@@ -68,9 +120,7 @@ final class LiveCallUITests: XCTestCase {
     func testThePhonesFirstCallSaysWhatItSendsToOpenAIOnce() {
         let app = launch(disclosureShown: false)
         openGmail(app)
-        let start = app.buttons["live-call-start"]
-        XCTAssertTrue(start.waitForExistence(timeout: 5))
-        start.tap()
+        app.tapStartCallFromHeader()
         let note = app.alerts.firstMatch
         XCTAssertTrue(note.waitForExistence(timeout: 5), "the disclosure comes before the first call")
         XCTAssertTrue(Self.text(Self.disclosure, in: note).exists)
@@ -78,14 +128,14 @@ final class LiveCallUITests: XCTestCase {
 
         note.buttons["Cancel"].tap()
         XCTAssertFalse(app.otherElements["live-call-bar"].waitForExistence(timeout: 2), "Cancel starts nothing")
-        start.tap()
+        app.tapStartCallFromHeader()
         XCTAssertTrue(note.waitForExistence(timeout: 5), "the next try shows it again")
         note.buttons["Start call"].tap()
         let title = app.staticTexts["live-call-title"]
         expectation(for: NSPredicate(format: "label BEGINSWITH %@", "Live with Pepper"), evaluatedWith: title)
         waitForExpectations(timeout: 10)
         app.buttons["live-call-hangup"].tap()
-        XCTAssertTrue(start.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.chatCanStartCall())
 
         // Start call was remembered on this phone: the next launch calls at once.
         let again = launch(disclosureShown: nil)
@@ -102,9 +152,7 @@ final class LiveCallUITests: XCTestCase {
         let app = launch(["-live-call-preview-slow-start"])
         openGmail(app)
 
-        let start = app.buttons["live-call-start"]
-        XCTAssertTrue(start.waitForExistence(timeout: 5))
-        start.tap()
+        app.tapStartCallFromHeader()
 
         let title = app.staticTexts["live-call-title"]
         XCTAssertTrue(title.waitForExistence(timeout: 5))
@@ -119,12 +167,12 @@ final class LiveCallUITests: XCTestCase {
         let bar = app.otherElements["live-call-bar"]
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: bar)
         waitForExpectations(timeout: 5)
-        XCTAssertTrue(start.waitForExistence(timeout: 5), "the header offers a call again at once")
+        XCTAssertTrue(app.chatCanStartCall(), "the header offers a call again at once")
 
         // The held 201 lands now; the controller ends that call instead.
         Thread.sleep(forTimeInterval: 4)
         XCTAssertFalse(bar.exists, "a late answer does not revive a call that was hung up")
-        XCTAssertTrue(start.exists)
+        XCTAssertTrue(app.chatCanStartCall())
         record("After hanging up while calling", app)
     }
 
@@ -137,9 +185,7 @@ final class LiveCallUITests: XCTestCase {
     func testACallWhoseAudioNeverConnectsIsDropped() {
         let app = launch(["-live-call-preview-no-audio"])
         openGmail(app)
-        let start = app.buttons["live-call-start"]
-        XCTAssertTrue(start.waitForExistence(timeout: 5))
-        start.tap()
+        app.tapStartCallFromHeader()
 
         let title = app.staticTexts["live-call-title"]
         expectation(for: NSPredicate(format: "label == %@", "Connecting…"), evaluatedWith: title)
@@ -166,7 +212,7 @@ final class LiveCallUITests: XCTestCase {
         let bar = app.otherElements["live-call-bar"]
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: bar)
         waitForExpectations(timeout: 10)
-        XCTAssertTrue(start.waitForExistence(timeout: 5), "the header offers a new call")
+        XCTAssertTrue(app.chatCanStartCall(), "the header offers a new call")
     }
 
     /// The sheet's first read of the Mac's settings is slow here; a change
@@ -190,7 +236,7 @@ final class LiveCallUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 4)
         XCTAssertEqual(toggle.value as? String, "0", "the older read did not undo the saved change")
         record("Settings after the slow read", app)
-        app.buttons["Done"].tap()
+        app.buttons["Close"].tap()
         app.buttons["live-call-hangup"].tap()
     }
 
@@ -217,7 +263,7 @@ final class LiveCallUITests: XCTestCase {
         expectation(for: NSPredicate(format: "value == '1'"), evaluatedWith: toggle)
         waitForExpectations(timeout: 5)
         record("Settings change that could not be saved", app)
-        app.buttons["Done"].tap()
+        app.buttons["Close"].tap()
         app.buttons["live-call-hangup"].tap()
     }
 
@@ -246,7 +292,7 @@ final class LiveCallUITests: XCTestCase {
         app.buttons["10 minutes"].tap()
         expectation(for: NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "10 minutes", "10 minutes"), evaluatedWith: idle)
         waitForExpectations(timeout: 5)
-        app.buttons["Done"].tap()
+        app.buttons["Close"].tap()
         app.buttons["live-call-hangup"].tap()
     }
 
@@ -276,7 +322,7 @@ final class LiveCallUITests: XCTestCase {
             expectation(for: NSPredicate(format: "value == '0'"), evaluatedWith: toggle)
             waitForExpectations(timeout: 5)
             if round == 3 { record("A setting changed while the voice talks", app) }
-            app.buttons["Done"].tap()
+            app.buttons["Close"].tap()
             expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: toggle)
             waitForExpectations(timeout: 5)
         }
@@ -348,7 +394,7 @@ final class LiveCallUITests: XCTestCase {
         let clock = app.staticTexts["live-call-remote-clock"]
         XCTAssertTrue(clock.label.hasPrefix("1:"), clock.label)
         XCTAssertEqual(app.staticTexts["live-call-remote-device"].label, "From your computer")
-        XCTAssertFalse(app.buttons["live-call-start"].exists, "no call from the header while the Mac holds the line")
+        XCTAssertFalse(app.chatCanStartCall(), "no call from the header while the Mac holds the line")
         let bar = remoteBar(app)
         assertTheLineKeepsTheClock(name: title, clock: clock, before: app.buttons["live-call-remote-hangup"], in: bar)
         assertWhole(app.staticTexts["live-call-remote-device"], in: bar)
@@ -362,7 +408,7 @@ final class LiveCallUITests: XCTestCase {
         app.buttons["live-call-remote-hangup"].tap()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: title)
         waitForExpectations(timeout: 5)
-        XCTAssertTrue(app.buttons["live-call-start"].waitForExistence(timeout: 5), "the line is free again")
+        XCTAssertTrue(app.chatCanStartCall(), "the line is free again")
         record("After the remote hang-up", app)
     }
 
@@ -408,7 +454,6 @@ final class LiveCallUITests: XCTestCase {
         let app = launch(["-live-call-room-preview"])
         openGmail(app)
         startCall(app)
-        let start = app.buttons["live-call-start"]
 
         app.buttons["Back"].tap()
         let room = app.buttons["chat-row.preview-room"]
@@ -440,7 +485,7 @@ final class LiveCallUITests: XCTestCase {
         let hangUp = app.buttons["live-call-hangup"]
         XCTAssertTrue(hangUp.waitForExistence(timeout: 5))
         hangUp.tap()
-        XCTAssertTrue(start.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.chatCanStartCall())
     }
 
     // MARK: - Helpers
@@ -513,7 +558,6 @@ final class LiveCallUITests: XCTestCase {
         let disclosure = disclosureShown.map { ["-companion.prefs.liveDisclosureShown", $0 ? "YES" : "NO"] } ?? []
         app.launchArguments = ["-store-preview", "-threads-preview", "-live-call-preview"] + extra + disclosure + [
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            "-companion.prefs.islandIntro", "never",
             "-companion.onboarding.welcomeSeen", "YES",
             "-companion.onboarding.notificationsSeen", "YES"]
         app.launch()
@@ -526,19 +570,25 @@ final class LiveCallUITests: XCTestCase {
 
     @MainActor
     private func openGmail(_ app: XCUIApplication) {
-        let toggle = app.buttons["threads-toggle.preview-pepper"]
-        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
-        toggle.tap()
-        let gmail = app.buttons["thread.preview-gmail"]
-        XCTAssertTrue(gmail.waitForExistence(timeout: 5))
-        gmail.tap()
+        let pepper = app.buttons["chat-row.preview-pepper"]
+        XCTAssertTrue(pepper.waitForExistence(timeout: 10))
+        pepper.tap()
+        let header = app.buttons["header-bot-actions"]
+        XCTAssertTrue(header.waitForExistence(timeout: 10))
+        let onGmail = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "Triage Gmail"), object: header
+        )
+        if XCTWaiter.wait(for: [onGmail], timeout: 3) != .completed {
+            app.openThreadsFromHeader()
+            let gmail = app.buttons["thread-preview-gmail"]
+            XCTAssertTrue(gmail.waitForExistence(timeout: 5))
+            gmail.tap()
+        }
     }
 
     @MainActor
     private func startCall(_ app: XCUIApplication) {
-        let start = app.buttons["live-call-start"]
-        XCTAssertTrue(start.waitForExistence(timeout: 5))
-        start.tap()
+        app.tapStartCallFromHeader()
         let title = app.staticTexts["live-call-title"]
         expectation(for: NSPredicate(format: "label BEGINSWITH %@", "Live with Pepper"), evaluatedWith: title)
         waitForExpectations(timeout: 10)

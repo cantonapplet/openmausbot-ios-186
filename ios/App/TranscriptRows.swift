@@ -250,8 +250,6 @@ struct TranscriptRowView: View, Equatable {
     /// The day the stamp was worded on: "Today 9:15" must become "Yesterday
     /// 9:15" after midnight even when the row itself has not changed.
     let today: Date
-    /// Last bubble of a run from the same side: the one with the tail.
-    let endsRun: Bool
     /// The versions of a user message, for its "1 of 2" switcher.
     let versions: [Message]
     /// This row is the stand-in for an edit the computer has not answered.
@@ -265,7 +263,7 @@ struct TranscriptRowView: View, Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.row == rhs.row && lhs.stamp == rhs.stamp && lhs.today == rhs.today
-            && lhs.endsRun == rhs.endsRun && lhs.versions == rhs.versions
+            && lhs.versions == rhs.versions
             && lhs.isPendingEdit == rhs.isPendingEdit && lhs.routineRun == rhs.routineRun
             && lhs.context == rhs.context && lhs.revealedMessageId == rhs.revealedMessageId
             && lhs.actions == rhs.actions
@@ -303,7 +301,7 @@ struct TranscriptRowView: View, Equatable {
         switch row {
         case let .message(message):
             MessageRow(
-                message: message, versions: versions, endsRun: endsRun,
+                message: message, versions: versions,
                 isPendingEdit: isPendingEdit, routineRun: routineRun,
                 context: context, actions: actions
             )

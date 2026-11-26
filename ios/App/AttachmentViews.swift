@@ -579,7 +579,7 @@ struct FilePreviewView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Done", action: close)
+                    CloseButton(action: close)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     ShareLink(item: item.url) {
