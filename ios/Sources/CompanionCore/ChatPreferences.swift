@@ -18,7 +18,7 @@ public enum ActivityDetail: String, CaseIterable, Codable, Sendable {
     /// What a phone starts with until the reader chooses: the phone should
     /// read like a normal chat (Omkar, 2026-10-03), and the desktop likewise
     /// hides tool calls until they are switched on. A stored choice wins.
-    public static let phoneDefault: ActivityDetail = .hidden
+    public static let phoneDefault: ActivityDetail = .reduced
 
     public var label: String {
         switch self {

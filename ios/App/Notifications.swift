@@ -1,4 +1,6 @@
 import Foundation
+import Intents
+import SwiftUI
 import UserNotifications
 import UIKit
 import CompanionCore
@@ -31,7 +33,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     /// notifications. While the person is in the app, the roster and Updates
     /// bar are the signal; a banner would duplicate them.
     @MainActor
-    func deliver(_ notification: NotificationFrame, sequence: Int?) {
+    func deliver(_ notification: NotificationFrame, sequence: Int?, botColor: String?) {
         guard UIApplication.shared.applicationState == .background else { return }
         let content = UNMutableNotificationContent()
         content.title = notification.title
@@ -46,10 +48,60 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         ]
         if notification.isBlocking { content.interruptionLevel = .timeSensitive }
 
+        // A messaging notification puts the bot's face where the app icon
+        // would otherwise be. If the system will not adopt the intent, the
+        // image falls back to a normal notification attachment.
+        var delivered: UNNotificationContent = content
+        if let botColor, let data = avatarData(for: botColor) {
+            let person = INPerson(
+                personHandle: INPersonHandle(value: notification.botId, type: .unknown),
+                nameComponents: nil,
+                displayName: notification.botName,
+                image: INImage(imageData: data),
+                contactIdentifier: nil,
+                customIdentifier: notification.botId
+            )
+            let intent = INSendMessageIntent(
+                recipients: nil,
+                outgoingMessageType: .outgoingMessageText,
+                content: notification.body,
+                speakableGroupName: nil,
+                conversationIdentifier: notification.threadId,
+                serviceName: "MausBot",
+                sender: person,
+                attachments: nil
+            )
+            let interaction = INInteraction(intent: intent, response: nil)
+            interaction.direction = .incoming
+            interaction.donate(completion: nil)
+            if let updated = try? content.updating(from: intent),
+               let mutable = updated.mutableCopy() as? UNMutableNotificationContent {
+                mutable.categoryIdentifier = content.categoryIdentifier
+                mutable.threadIdentifier = content.threadIdentifier
+                mutable.userInfo = content.userInfo
+                if notification.isBlocking { mutable.interruptionLevel = .timeSensitive }
+                delivered = mutable
+            }
+        }
+
         // A replay after a short disconnect must reconcile a missed alert,
         // but a repeated frame must not draw it twice.
         let identifier = "openmaus.\(notification.threadId).\(sequence.map(String.init) ?? notification.title)"
-        center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+        center.add(UNNotificationRequest(identifier: identifier, content: delivered, trigger: nil))
+    }
+
+    /// The bot's face rendered once, used either as the sender image or as
+    /// the fallback attachment.
+    @MainActor
+    private func avatarData(for colorName: String) -> Data? {
+        let face = ZStack {
+            Rectangle().fill(MausPalette.color(colorName))
+            MausFaceStill(color: colorName, state: .idle, size: 72)
+        }
+        .frame(width: 96, height: 96)
+        let renderer = ImageRenderer(content: face)
+        renderer.scale = 3
+        return renderer.uiImage?.pngData()
     }
 
     /// Opening the app takes every delivered alert out of Notification

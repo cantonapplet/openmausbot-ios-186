@@ -202,7 +202,7 @@ final class ThreadNavigationUITests: XCTestCase {
     func testFailedCreationKeepsThreadPickerOpenWithError() {
         let app = launchPreview()
         openGmail(in: app)
-        app.openThreadsFromHeader()
+        app.openThreadManagerFromHeader()
         let create = app.buttons["new-thread"]
         XCTAssertTrue(create.waitForExistence(timeout: 5))
         // The preview deliberately has no API client, so this cannot write
@@ -244,7 +244,7 @@ final class ThreadNavigationUITests: XCTestCase {
     func testBulkDeletionKeepsCurrentAndWorkingThread() {
         let app = launchPreview(extraArguments: ["-threads-preview-deletion"])
         openGmail(in: app)
-        app.openThreadsFromHeader()
+        app.openThreadManagerFromHeader()
         app.buttons["select-threads"].tap()
 
         XCTAssertFalse(app.buttons["select-thread-preview-gmail"].isEnabled)
@@ -276,7 +276,7 @@ final class ThreadNavigationUITests: XCTestCase {
             "-threads-preview-deletion", "-threads-preview-deletion-fails-weekend"
         ])
         openGmail(in: app)
-        app.openThreadsFromHeader()
+        app.openThreadManagerFromHeader()
         app.buttons["select-threads"].tap()
         app.buttons["select-all-threads"].tap()
         app.buttons["delete-selected-threads"].tap()
@@ -326,6 +326,8 @@ final class ThreadNavigationUITests: XCTestCase {
         let row = app.buttons["chat-row.preview-pepper"]
         XCTAssertTrue(row.waitForExistence(timeout: 10))
         row.press(forDuration: 0.6)
+        XCTAssertTrue(app.buttons["Threads"].waitForExistence(timeout: 5))
+        app.buttons["Threads"].tap()
         let gmail = app.buttons["Triage Gmail"].firstMatch
         XCTAssertTrue(gmail.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["Triage iCloud"].firstMatch.exists)

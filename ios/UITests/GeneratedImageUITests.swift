@@ -33,10 +33,10 @@ final class GeneratedImageUITests: XCTestCase {
         expectation(for: loaded, evaluatedWith: image)
         waitForExpectations(timeout: 10)
         image.tap()
-        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.otherElements["Image canvas"].waitForExistence(timeout: 10))
+        let canvas = app.otherElements["Image canvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 10))
         record("Agent image full screen", app)
-        app.buttons["Close"].tap()
+        canvas.swipeDown()
         XCTAssertTrue(image.waitForExistence(timeout: 5))
     }
 

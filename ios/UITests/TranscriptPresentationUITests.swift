@@ -76,10 +76,8 @@ final class TranscriptPresentationUITests: XCTestCase {
     @MainActor
     func testHiddenFoldsNarrationAndWebhookPayloadCanBeExpanded() {
         let app = launchPreview(detail: "hidden")
-        let fold = app.buttons["assistant-turn.preview-turn"]
-        XCTAssertTrue(fold.waitForExistence(timeout: 5))
-        XCTAssertEqual(fold.label, "Worked for 4s")
         XCTAssertTrue(app.staticTexts["The build failed because a dependency is missing."].exists)
+        XCTAssertFalse(app.buttons["assistant-turn.preview-turn"].exists, "the Worked for chip is gone after the reply")
         XCTAssertFalse(contains("Let me inspect", in: app))
         XCTAssertTrue(app.staticTexts["Triage the build failure."].exists)
         XCTAssertFalse(contains("AUTHENTICATED WEBHOOK", in: app))
@@ -89,13 +87,6 @@ final class TranscriptPresentationUITests: XCTestCase {
         // nothing left to type.
         XCTAssertFalse(app.descendants(matching: .any)["typing-indicator"].exists, "a finished reply ends the typing")
         screenshot("Compact transcript with Hidden activity", in: app)
-
-        fold.tap()
-        XCTAssertTrue(contains("Let me inspect the build logs.", in: app))
-        XCTAssertTrue(contains("I found the failing check.", in: app))
-        screenshot("Expanded narration uses a single final bubble tail", in: app)
-        fold.tap()
-        XCTAssertFalse(contains("Let me inspect", in: app))
 
         app.buttons["Event payload"].tap()
         XCTAssertTrue(app.staticTexts["webhook-payload"].waitForExistence(timeout: 3))
@@ -145,17 +136,16 @@ final class TranscriptPresentationUITests: XCTestCase {
     @MainActor
     func testHiddenSuppressesLiveReasoning() {
         let app = launchPreview(detail: "hidden", reasoning: true)
-        XCTAssertTrue(app.buttons["assistant-turn.preview-turn"].waitForExistence(timeout: 5))
         XCTAssertFalse(contains("Thinking…", in: app))
         // Thinking hidden, the bubble still says the bot is on it.
         assertTypingBubbleInView(app)
     }
 
     @MainActor
-    func testFullKeepsLiveReasoningAvailable() {
+    func testThinkingStaysHiddenAtFullDetail() {
         let app = launchPreview(detail: "full", reasoning: true)
-        XCTAssertTrue(app.staticTexts["Thinking…"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["assistant-turn.preview-turn"].exists)
+        XCTAssertFalse(contains("Thinking…", in: app))
+        XCTAssertTrue(app.staticTexts["The build failed because a dependency is missing."].exists)
     }
 
     /// The typing bubble is on screen, not merely in the tree: XCUITest

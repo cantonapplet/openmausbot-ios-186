@@ -31,8 +31,20 @@ extension XCUIApplication {
         let threads = buttons["Threads"]
         XCTAssertTrue(threads.waitForExistence(timeout: 10), "Threads in bot settings", file: file, line: line)
         threads.tap()
-        // Settings closes and the picker rises after it; wait for the picker
-        // itself so callers do not tap into the gap between the two sheets.
+        // The threads dropdown opens; callers then tap a thread row.
+        XCTAssertTrue(buttons["Manage threads"].waitForExistence(timeout: 10), "threads dropdown", file: file, line: line)
+    }
+
+    /// Face → Threads → Manage threads, which opens the full thread picker.
+    @MainActor
+    func openThreadManagerFromHeader(file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(openChatActions(), "bot settings", file: file, line: line)
+        let threads = buttons["Threads"]
+        XCTAssertTrue(threads.waitForExistence(timeout: 10), "Threads in bot settings", file: file, line: line)
+        threads.tap()
+        let manage = buttons["Manage threads"]
+        XCTAssertTrue(manage.waitForExistence(timeout: 10), "Manage threads in the dropdown", file: file, line: line)
+        manage.tap()
         XCTAssertTrue(buttons["select-threads"].waitForExistence(timeout: 10), "thread picker", file: file, line: line)
     }
 

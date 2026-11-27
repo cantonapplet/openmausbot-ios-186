@@ -1165,7 +1165,8 @@ final class Session: ObservableObject {
                 activityUpdates.send(event.threadId)
             }
             if case let .notify(notification) = frame.frame {
-                NotificationCoordinator.shared.deliver(notification, sequence: frame.seq)
+                let color = state.bots.first { $0.id == notification.botId }?.color
+                NotificationCoordinator.shared.deliver(notification, sequence: frame.seq, botColor: color)
             }
         }
         NotificationCoordinator.shared.setBadge(state.unreadCount)

@@ -23,6 +23,14 @@ struct CompanionApp: App {
     @AppStorage(PrefKey.language) private var language = AppLanguage.system.rawValue
     @AppStorage(PrefKey.appearance) private var appearance = AppAppearance.system.rawValue
 
+    init() {
+        // Reduced is now the app's only activity view. The launch argument
+        // still lets UI tests exercise the other shapes.
+        if !ProcessInfo.processInfo.arguments.contains("-companion.prefs.activityDetail") {
+            UserDefaults.standard.set(ActivityDetail.reduced.rawValue, forKey: PrefKey.activityDetail)
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

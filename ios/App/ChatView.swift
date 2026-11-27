@@ -177,13 +177,17 @@ struct ChatView: View {
         let all = session.state.transcript(forThread: threadId)
         let busy = current.busy
         let detail = detail
-        let key = TranscriptMemo.Key(threadId: threadId, busy: busy, detail: detail)
+        let streaming = !(session.state.streaming[threadId] ?? "").isEmpty
+        let key = TranscriptMemo.Key(
+            threadId: threadId, busy: busy, detail: detail,
+            streaming: streaming, revealed: revealedMessageId
+        )
         if let reused = snapshotMemo.snapshot(for: key, messages: messages, all: all) { return reused }
         let live = liveNarration(messages, busy: busy, detail: detail)
         let shown = live.hiddenIds.isEmpty ? messages : messages.filter { !live.hiddenIds.contains($0.id) }
         let snapshot = TranscriptSnapshot(
             messages: messages,
-            rows: transcriptRows(shown, detail: detail),
+            rows: visibleRows(transcriptRows(shown, detail: detail), messages: messages, streaming: streaming),
             versions: session.state.userMessageVersions(inThread: threadId),
             live: live,
             hasPendingApproval: messages.contains { $0.card?.isPending == true }
@@ -199,6 +203,8 @@ struct ChatView: View {
             let threadId: String
             let busy: Bool
             let detail: ActivityDetail
+            let streaming: Bool
+            let revealed: String?
         }
 
         private var key: Key?
@@ -218,6 +224,56 @@ struct ChatView: View {
             self.messages = messages
             self.all = all
             self.snapshot = snapshot
+        }
+    }
+
+    /// Activity is a working indicator, not history: once the bot starts
+    /// speaking directly, its steps go away. The digest ("What I did · …")
+    /// is a receipt about the turn, not part of the conversation.
+    private func visibleRows(
+        _ rows: [TranscriptRow], messages: [Message], streaming: Bool
+    ) -> [TranscriptRow] {
+        let answered = Set(messages.compactMap { message -> String? in
+            guard message.role == .bot, message.kind == .text,
+                  message.turnTerminal == true, !(message.text ?? "").isEmpty
+            else { return nil }
+            return message.turnId
+        })
+        // A lone tool step takes the same minimal shape as a run, so the
+        // "Running" receipt is not a second activity design.
+        let normalized = rows.map { row -> TranscriptRow in
+            guard detail == .reduced,
+                  case let .message(message) = row,
+                  message.kind == .activity,
+                  let tool = message.tool,
+                  tool.ok != false,
+                  tool.claudeUpdate != true,
+                  message.threadRef == nil,
+                  !message.isTeammateReport,
+                  !isStatusNotice(message)
+            else { return row }
+            return .activityRun([message])
+        }
+        return normalized.filter { row in
+            switch row {
+            case let .message(message):
+                if message.kind == .digest { return false }
+                return !isNoisyStatus(message)
+            case let .activityRun(items):
+                if streaming { return false }
+                return !items.contains { item in
+                    guard let turn = item.turnId else { return false }
+                    return answered.contains(turn)
+                }
+            case let .assistantTurn(turn):
+                guard answered.contains(turn.turnId) else { return true }
+                // Keep the fold only when it holds the search hit being
+                // revealed; otherwise the "Worked for …" receipt is gone.
+                guard let revealedMessageId else { return false }
+                return turn.messages.contains { $0.id == revealedMessageId }
+            default:
+                return true
+            }
         }
     }
 
@@ -477,6 +533,17 @@ struct ChatView: View {
         // And a drag down over the transcript pushes it away, the way
         // it does in Mail and Messages.
         .scrollDismissesKeyboard(.interactively)
+        // Ride the keyboard's own hide animation back to the end. UIKit
+        // already animates the inset; this keeps the last message travelling
+        // with it instead of snapping once the inset lands.
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { note in
+            guard !rows.isEmpty, !readerDetached else { return }
+            let raw = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+            let duration = max(raw, 0.2)
+            withAnimation(.easeInOut(duration: duration)) {
+                proxy.scrollTo(Self.transcriptEndId, anchor: .bottom)
+            }
+        }
         .modifier(FollowsLatest(
             proxy: proxy,
             lastRowId: transcript.last?.id,
@@ -509,6 +576,27 @@ struct ChatView: View {
     }
 
     /// The rows, then whatever is live, then the end marker.
+    /// Status lines the reader does not need: a provider that answered
+    /// slowly, or one that has gone quiet. Both are noise beside the reply.
+    private func isNoisyStatus(_ message: Message) -> Bool {
+        let text = [message.tool?.name ?? "", message.tool?.spoken ?? "", message.text ?? ""]
+            .joined(separator: " ")
+            .lowercased()
+        return text.contains("slow start")
+            || text.contains("hasn't heard back")
+            || text.contains("has not heard back")
+            || text.contains("heard back from provider")
+    }
+
+    private var liveTextActive: Bool {
+        current.busy && !(session.state.streaming[threadId] ?? "").isEmpty
+    }
+
+    private func isSettledBotReply(_ row: TranscriptRow) -> Bool {
+        guard case let .message(message) = row else { return false }
+        return message.role == .bot && message.kind == .text && message.turnTerminal == true
+    }
+
     private func transcriptColumn(
         proxy: ScrollViewProxy, snapshot: TranscriptSnapshot, actions: TranscriptActions
     ) -> some View {
@@ -543,6 +631,14 @@ struct ChatView: View {
                     .equatable()
                     .padding(.top, roleGap(at: index, in: transcript))
                     .id(row.id)
+                    .transition(
+                        isSettledBotReply(row)
+                            ? .opacity
+                            : .asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .opacity
+                            )
+                    )
             }
 
             liveTail(snapshot)
@@ -551,6 +647,20 @@ struct ChatView: View {
         .padding(.vertical, 12)
         .frame(maxWidth: CompanionLayout.chatWidth, alignment: .leading)
         .frame(maxWidth: .infinity)
+        // New messages and the working tail slide in from the bottom; the
+        // opening landing itself is not animated.
+        .animation(
+            reduceMotion || !hasLandedOnEnd ? nil : .spring(response: 0.28, dampingFraction: 0.9),
+            value: transcript.map(\.id)
+        )
+        .animation(
+            reduceMotion || !hasLandedOnEnd ? nil : .spring(response: 0.28, dampingFraction: 0.9),
+            value: current.busy
+        )
+        .animation(
+            reduceMotion || !hasLandedOnEnd ? nil : .spring(response: 0.28, dampingFraction: 0.9),
+            value: liveTextActive
+        )
     }
 
     private func loadEarlierButton(proxy: ScrollViewProxy, transcript: [TranscriptRow]) -> some View {
@@ -666,21 +776,23 @@ struct ChatView: View {
     /// At Hidden the words go to the status line above the composer; the
     /// transcript keeps the typing bubble, which says the bot is still on it.
     @ViewBuilder private func liveTail(_ snapshot: TranscriptSnapshot) -> some View {
-        if current.busy, detail != .hidden, let live = session.state.streaming[threadId], !live.isEmpty {
-            StreamingBubble(text: live, reasoning: nil, color: current.color)
-                .id(Self.liveBubbleId)
-        } else if current.busy, activityDetail != ActivityDetail.hidden.rawValue,
-                  let thinking = session.state.reasoning[threadId], !thinking.isEmpty {
-            // Only while there is no answer yet. Once tokens
-            // of the reply exist, the reasoning is behind us
-            // and showing both is just noise.
-            StreamingBubble(text: nil, reasoning: thinking, color: current.color)
-                .id(Self.liveBubbleId)
-        } else if showsTyping(snapshot) {
-            TypingIndicatorView(name: current.name)
-                .id(Self.liveBubbleId)
-                .onAppear(perform: announceTyping)
+        Group {
+            if current.busy, detail != .hidden, let live = session.state.streaming[threadId], !live.isEmpty {
+                StreamingBubble(text: live, reasoning: nil, color: current.color)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+            } else if showsTyping(snapshot) {
+                TypingIndicatorView(name: current.name)
+                    .onAppear(perform: announceTyping)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+            }
         }
+        .id(Self.liveBubbleId)
     }
 
     /// VoiceOver hears "Pepper is typing" once a turn, when the bubble first
@@ -732,10 +844,10 @@ struct ChatView: View {
                 readerDetached = false
                 withAnimation { proxy.scrollTo(Self.transcriptEndId, anchor: .bottom) }
             } label: {
-                Label("Jump to latest", systemImage: "arrow.down")
-                    .font(.footnote.weight(.medium))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 36, height: 36)
                     .glassCapsule(interactive: false)
                     .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
             }
@@ -962,8 +1074,6 @@ struct ChatView: View {
             .accessibilityLabel("Back")
             .accessibilityValue(unreadElsewhere > 0 ? "\(unreadElsewhere) unread elsewhere" : "")
 
-            Spacer(minLength: 8)
-
             headerTitle
 
             Spacer(minLength: 8)
@@ -1115,6 +1225,15 @@ struct ChatView: View {
             screenCover = .browser
         case .liveCall:
             if case let .bot(bot) = current { requestLiveCall(bot) }
+        case let .open(chat):
+            selectedThreadId = chat.threadId
+        case .newThread:
+            guard case let .bot(bot) = current else { break }
+            Task {
+                if let created = await session.createRosterThread(for: bot) {
+                    selectedThreadId = created.threadId
+                }
+            }
         }
     }
 
@@ -1211,7 +1330,6 @@ struct ChatView: View {
     }
 
     private var composerPrompt: String {
-        if sendingMessage { return "Sending…" }
         if dictation.isListening { return "Listening…" }
         if let asker = composerQuestion?.asker { return String(localized: "Answer \(asker)…") }
         if current.busy { return engineCanSteer ? "Sends into this turn" : "Sends after this turn" }
@@ -1600,11 +1718,11 @@ struct ChatView: View {
     /// Progress and errors above the field: preparing or sending, a file
     /// opening, a failed send or attachment, a dictation failure.
     @ViewBuilder private var composerNotices: some View {
-        if preparingAttachments || sendingMessage {
+        if preparingAttachments {
             HStack(spacing: 8) {
                 ProgressView()
                     .controlSize(.small)
-                Text(preparingAttachments ? "Preparing attachments…" : "Sending…")
+                Text("Preparing attachments…")
                     .font(.system(size: 13, weight: .medium))
             }
             .foregroundStyle(Color.secondary)
@@ -1691,10 +1809,12 @@ struct ChatView: View {
                         stopButton
                     }
 
-                    // One slot: dictation until there is something to send,
-                    // then the send arrow. While dictation itself is running
+                    // One slot: a spinner while the send is in flight,
+                    // then dictation/send. While dictation itself is running
                     // it stays the stop control, even as the transcript fills.
-                    if dictation.isListening || dictation.isStarting {
+                    if sendingMessage {
+                        sendingButton
+                    } else if dictation.isListening || dictation.isStarting {
                         dictationButton
                     } else if showsSend {
                         sendButton(canSend: canSend(text.wrappedValue))
@@ -1814,12 +1934,26 @@ struct ChatView: View {
         .accessibilityLabel(listening ? "Stop dictation" : "Start dictation")
     }
 
+    /// The same round send control, with the system spinner while the line
+    /// is on its way to the computer. No separate "Sending…" label.
+    private var sendingButton: some View {
+        ProgressView()
+            .controlSize(.small)
+            .tint(BubbleColor.mineText(for: current.color))
+            .frame(width: 32, height: 32)
+            .background(Circle().fill(BubbleColor.mine(for: current.color)))
+            .padding(.trailing, 6)
+            .padding(.bottom, 6)
+            .accessibilityLabel("Sending message")
+    }
+
     private func sendButton(canSend: Bool) -> some View {
-        let fill: Color = canSend ? BubbleColor.mine : Color.secondary.opacity(0.18)
+        let botColor = current.color
+        let fill: Color = canSend ? BubbleColor.mine(for: botColor) : Color.secondary.opacity(0.18)
         return Button { submit() } label: {
             Image(systemName: "arrow.up")
                 .font(.system(size: 15, weight: .bold))
-                .foregroundStyle(canSend ? Color.white : Color.secondary)
+                .foregroundStyle(canSend ? BubbleColor.mineText(for: botColor) : Color.secondary)
                 .frame(width: 32, height: 32)
                 .background(Circle().fill(fill))
         }
@@ -1900,7 +2034,9 @@ private struct FollowsLatest: ViewModifier {
             .onValueChange(of: lastRowId, initial: true) { last in
                 guard last != nil, follows || !landed else { return }
                 landed = true
-                withAnimation { proxy.scrollTo(ChatView.transcriptEndId, anchor: .bottom) }
+                withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.9)) {
+                    proxy.scrollTo(ChatView.transcriptEndId, anchor: .bottom)
+                }
             }
             // The bubble also comes and goes with no new message to follow:
             // the turn is accepted a frame after your message lands, a tool
@@ -1908,7 +2044,7 @@ private struct FollowsLatest: ViewModifier {
             // are up in the scrollback reading.
             .onValueChange(of: typing) { shown in
                 guard shown, follows else { return }
-                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.9)) {
                     proxy.scrollTo(ChatView.transcriptEndId, anchor: .bottom)
                 }
             }
@@ -1991,9 +2127,6 @@ struct MessageRow: View, Equatable {
                 reactionButtons(reactions)
             }
 
-            if versions.count > 1, let index = versions.firstIndex(where: { $0.id == message.id }), context.isBot {
-                versionSwitcher(at: index)
-            }
         }
         .contextMenu { menu(presentation) }
         .alert("Edit and retry", isPresented: $showingEdit) {
@@ -2013,37 +2146,6 @@ struct MessageRow: View, Equatable {
         .sheet(item: $digest) { DigestSheet(summary: $0) }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("message-\(message.id)")
-    }
-
-    private func reactionButtons(_ reactions: [Reaction]) -> some View {
-        HStack(spacing: 6) {
-            ForEach(reactionGroups(reactions), id: \.emoji) { group in
-                Button("\(group.emoji) \(group.count)") {
-                    Haptics.selection()
-                    Task { await actions.react(to: message, emoji: group.emoji) }
-                }
-                .font(.system(size: 13))
-                .buttonStyle(.bordered)
-                .buttonBorderShape(.capsule)
-                .tint(group.mine ? Color.accentColor : Color.secondary)
-            }
-        }
-    }
-
-    private func versionSwitcher(at index: Int) -> some View {
-        HStack(spacing: 8) {
-            Button {
-                Task { await actions.switchVersion(to: versions[index - 1]) }
-            } label: { Image(systemName: "chevron.left") }
-            .disabled(index == 0 || context.busy)
-            Text("\(index + 1) of \(versions.count)")
-            Button {
-                Task { await actions.switchVersion(to: versions[index + 1]) }
-            } label: { Image(systemName: "chevron.right") }
-            .disabled(index + 1 >= versions.count || context.busy)
-        }
-        .font(.system(size: 12, weight: .medium))
-        .foregroundStyle(Color.secondary)
     }
 
     @ViewBuilder
@@ -2149,6 +2251,21 @@ struct MessageRow: View, Equatable {
 
     private func bubble(_ presentation: MessagePresentation) -> TextBubble {
         TextBubble(message: message, presentation: presentation, context: context, actions: actions)
+    }
+
+    private func reactionButtons(_ reactions: [Reaction]) -> some View {
+        HStack(spacing: 6) {
+            ForEach(reactionGroups(reactions), id: \.emoji) { group in
+                Button("\(group.emoji) \(group.count)") {
+                    Haptics.selection()
+                    Task { await actions.react(to: message, emoji: group.emoji) }
+                }
+                .font(.system(size: 13))
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .tint(group.mine ? Color.accentColor : Color.secondary)
+            }
+        }
     }
 
     private func reactionGroups(_ reactions: [Reaction]) -> [(emoji: String, count: Int, mine: Bool)] {
@@ -2281,7 +2398,7 @@ struct ActivityChip: View {
             // carry raw output, and that log stays on the computer's side.
             let output = outputIsProse ? tool.expandableOutput : nil
             let receipt = SkillExecutionReceiptView(
-                skillName: tool.label,
+                skillName: tool.displayLabel,
                 status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
                 output: output ?? "",
                 outputIsProse: outputIsProse
@@ -3232,6 +3349,8 @@ struct StreamingBubble: View {
     let text: String?
     let reasoning: String?
     var color: String = "blue"
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var chunkOpacity: Double = 1
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 0) {
@@ -3253,8 +3372,14 @@ struct StreamingBubble: View {
                     // half-finished markdown this is always holding — an
                     // unclosed fence renders as code, an unclosed link as the
                     // characters typed so far.
-                    MarkdownText(source: text, caret: true)
+                    MarkdownText(source: text)
                         .foregroundStyle(Color.primary)
+                        .opacity(chunkOpacity)
+                        .onValueChange(of: text) { _ in
+                            guard !reduceMotion else { return }
+                            chunkOpacity = 0.72
+                            withAnimation(.easeOut(duration: 0.12)) { chunkOpacity = 1 }
+                        }
                 }
             }
             .padding(.horizontal, 15)

@@ -306,7 +306,7 @@ struct TranscriptRowView: View, Equatable {
                 context: context, actions: actions
             )
         case let .activityRun(items):
-            ActivityRunChip(items: items, openThread: actions.openThread)
+            ActivityRunChip(items: items)
         case let .assistantTurn(turn):
             AssistantTurnChip(
                 turn: turn, context: context, actions: actions, revealedMessageId: revealedMessageId

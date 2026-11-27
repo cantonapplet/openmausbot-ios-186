@@ -85,7 +85,7 @@ struct ConversationPreviewView: View {
             .frame(maxHeight: .infinity)
         }
         .frame(width: UIScreen.main.bounds.width - 32)
-        .frame(height: 375)
+        .frame(height: 400)
         .background(Color.appBackground)
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .accessibilityElement(children: .contain)

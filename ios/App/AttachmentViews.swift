@@ -153,6 +153,8 @@ struct TranscriptAttachmentView: View {
     @State private var thumbnailVisible = false
     @State private var preview: FilePreviewItem?
     @State private var previewTask: Task<Void, Never>?
+    @Namespace private var imageZoom
+    @State private var showingImage = false
     /// The card's shape once the image has been seen. Unlike the thumbnail
     /// it is kept when the card scrolls far away, so the card never shrinks
     /// back to the placeholder and jumps again on the way back.
@@ -227,47 +229,40 @@ struct TranscriptAttachmentView: View {
     /// the picture is drawn in an overlay and is never measured, so no image
     /// — however wide — can push the bubble, and with it the whole chat,
     /// past the screen's edges again.
+    @ViewBuilder
     private var imageCard: some View {
         let aspect = knownAspect
         let width = CGFloat(aspect.map { TranscriptImageFit.maximumCardWidth(aspect: Double($0)) }
             ?? TranscriptImageFit.maximumWidth)
-        return Button(action: openPreview) {
-            VStack(alignment: .leading, spacing: 5) {
-                imageBox(aspect: aspect)
-                    .frame(maxWidth: width)
-                    .background(foreground.opacity(0.12))
-                    .overlay { imageContent }
-                    .clipShape(RoundedRectangle(cornerRadius: 13))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 13)
-                            .strokeBorder(foreground.opacity(0.18))
-                    }
-
-                HStack(spacing: 5) {
-                    Image(systemName: "photo")
-                        .accessibilityHidden(true)
-                    Text(attachment.name)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if previewLoading {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(foreground)
-                            .accessibilityHidden(true)
-                    }
-                }
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(foreground.opacity(0.75))
-                .padding(.horizontal, 2)
-                .frame(maxWidth: width, alignment: .leading)
-            }
+        let card = imageBox(aspect: aspect)
+            .frame(maxWidth: width)
+            .overlay { imageContent }
+            .clipShape(RoundedRectangle(cornerRadius: 13))
             .contentShape(Rectangle())
+
+        if #available(iOS 18.0, *), let thumbnail {
+            Button { showingImage = true } label: { card }
+                .buttonStyle(.plain)
+                .matchedTransitionSource(id: attachment.path, in: imageZoom)
+                .navigationDestination(isPresented: $showingImage) {
+                    ZoomedImagePreview(image: thumbnail, name: attachment.name) {
+                        showingImage = false
+                    }
+                    .navigationTransition(.zoom(sourceID: attachment.path, in: imageZoom))
+                }
+                .accessibilityLabel("Image: \(attachment.name)")
+                .accessibilityValue("Loaded")
+                .accessibilityHint("Opens the image full screen")
+        } else {
+            Button(action: openPreview) {
+                card
+            }
+            .buttonStyle(.plain)
+            .disabled(previewLoading || thumbnailLoading)
+            .accessibilityLabel("Image: \(attachment.name)")
+            .accessibilityValue(thumbnail != nil ? "Loaded" : (thumbnailLoading ? "Loading" : "Unavailable"))
+            .accessibilityHint(thumbnail == nil ? "Loads the image preview" : "Opens the image full screen")
         }
-        .buttonStyle(.plain)
-        .disabled(previewLoading || thumbnailLoading)
-        .accessibilityLabel("Image: \(attachment.name)")
-        .accessibilityValue(thumbnail != nil ? "Loaded" : (thumbnailLoading ? "Loading" : "Unavailable"))
-        .accessibilityHint(thumbnail == nil ? "Loads the image preview" : "Opens the image full screen")
     }
 
     /// An empty box at the card's size: the image's clamped shape once it is
@@ -609,6 +604,44 @@ struct FilePreviewView: View {
             return .handled
         }
         return .systemAction(url)
+    }
+}
+
+@available(iOS 18.0, *)
+private struct ZoomedImagePreview: View {
+    let image: UIImage
+    let name: String
+    let close: () -> Void
+    @State private var dragY: CGFloat = 0
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .scaleEffect(1 - min(abs(dragY) / 1400, 0.18))
+                .offset(y: dragY)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel(name)
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("Image canvas")
+        .gesture(
+            DragGesture()
+                .onChanged { value in dragY = value.translation.height }
+                .onEnded { value in
+                    if abs(value.translation.height) > 60 {
+                        close()
+                    } else {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) { dragY = 0 }
+                    }
+                }
+        )
+        .navigationBarBackButtonHidden(true)
+        .toolbar(.hidden, for: .navigationBar)
+        .statusBarHidden()
     }
 }
 

@@ -10,6 +10,8 @@ enum AgentProfileAction {
     case computer
     case browser
     case liveCall
+    case open(Chat)
+    case newThread
 }
 
 
@@ -185,6 +187,8 @@ struct AgentProfileView: View {
         // Pushed from a chat/roster that hides its bar, so opt this page back
         // into the system back button.
         .toolbar(.visible, for: .navigationBar)
+        .navigationBarBackButtonHidden(true)
+        .background(SwipeBackBridge())
         .toolbar { profileToolbar }
         .accessibilityIdentifier("bot-settings-page")
         // Auto-saving: every field writes through as it changes, so the page
@@ -247,20 +251,60 @@ struct AgentProfileView: View {
         }
     }
 
-    /// Threads beside the system back button, both in the toolbar's own
-    /// Liquid Glass. Nothing here draws a background: the bar supplies it.
+    /// Back matches the conversation's own round chevron. Threads is a
+    /// native dropdown of this bot's threads instead of a second sheet.
     @ToolbarContentBuilder
     private var profileToolbar: some ToolbarContent {
+        if #available(iOS 26.0, *) {
+            ToolbarItem(placement: .topBarLeading) { backButton }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .topBarLeading) { backButton }
+        }
+
         if onAction != nil {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    onAction?(.threads)
+                Menu {
+                    ForEach(current.visibleTasks, id: \.threadId) { task in
+                        Button(task.displayTitle) {
+                            if let projected = current.projected(forThread: task.threadId) {
+                                onAction?(.open(.bot(projected)))
+                            }
+                        }
+                        .accessibilityIdentifier("thread-\(task.threadId)")
+                    }
+                    if !current.visibleTasks.isEmpty { Divider() }
+                    Button {
+                        onAction?(.newThread)
+                    } label: {
+                        Label("New thread", systemImage: "plus")
+                    }
+                    Divider()
+                    Button {
+                        onAction?(.threads)
+                    } label: {
+                        Label("Manage threads", systemImage: "slider.horizontal.3")
+                    }
                 } label: {
-                    Image(systemName: "square.stack")
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 14, weight: .medium))
                 }
                 .accessibilityLabel("Threads")
             }
         }
+    }
+
+    private var backButton: some View {
+        Button { dismiss() } label: {
+            Image(systemName: "chevron.left")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.primary)
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassCapsule()
+        .accessibilityLabel("Back")
     }
 
     private var chatActionsSection: some View {

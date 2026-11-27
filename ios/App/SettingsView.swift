@@ -7,7 +7,6 @@ import UIKit
 struct SettingsView: View {
     @EnvironmentObject private var session: Session
     @State private var enablingNotifications = false
-    @AppStorage(PrefKey.activityDetail) private var activityDetail = ActivityDetail.phoneDefault.rawValue
     @AppStorage(PrefKey.language) private var language = AppLanguage.system.rawValue
     @AppStorage(PrefKey.appearance) private var appearance = AppAppearance.system.rawValue
     @AppStorage(PrefKey.updatesPill) private var updatesPill = false
@@ -54,28 +53,6 @@ struct SettingsView: View {
                     Text("Language")
                 } footer: {
                     Text("Changes the language inside OpenMausMobile. Buttons drawn by iOS itself follow the phone's language, which you can set for this app in iOS Settings.")
-                }
-
-                Section {
-                    Picker(selection: $activityDetail) {
-                        ForEach(ActivityDetail.allCases, id: \.rawValue) { level in
-                            Text(LocalizedStringKey(level.label)).tag(level.rawValue)
-                        }
-                    } label: {
-                        Text("Activity")
-                    }
-                } header: {
-                    Text("Chat")
-                } footer: {
-                    Text(LocalizedStringKey(ActivityDetail(rawValue: activityDetail)?.caption ?? ""))
-                }
-
-                Section {
-                    Toggle("Updates pill", isOn: $updatesPill)
-                } header: {
-                    Text("Home")
-                } footer: {
-                    Text("Shows the live status pill at the bottom of Home.")
                 }
 
                 Section {

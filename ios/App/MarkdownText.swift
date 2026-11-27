@@ -376,10 +376,16 @@ struct MarkdownText: View {
         let key = text as NSString
         if let cached = Self.inlineCache.object(forKey: key) { return cached.text }
         if live, let cached = Self.liveInlineCache.object(forKey: key) { return cached.text }
-        let attributed = (try? AttributedString(
+        var attributed = (try? AttributedString(
             markdown: text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(text)
+        // Links read as links: the app's pale blue and underlined.
+        let linkColor = Color(red: 141 / 255, green: 190 / 255, blue: 250 / 255)
+        for run in attributed.runs where run.link != nil {
+            attributed[run.range].foregroundColor = linkColor
+            attributed[run.range].underlineStyle = .single
+        }
         let bytes = text.utf8.count
         if bytes <= 8_192 {
             let cache = live ? Self.liveInlineCache : Self.inlineCache

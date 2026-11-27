@@ -1,86 +1,120 @@
-// A folded run of activity: one line standing in for several chips.
-//
-// What "Reduced" buys the reader. A bot that ran four tools in a row leaves
-// four receipts, and past the second one they stop carrying information —
-// so the run becomes a single line that says how many there were, and opens
-// back into the real chips on a tap.
-//
-// Failures never arrive here: `transcriptRows` breaks them out before a run
-// is formed, so anything folded is either finished or still going.
+// The reduced transcript's activity: a short, quiet list of the steps a bot
+// has taken and the one it is on, newest at the bottom.
 import SwiftUI
 import CompanionCore
 
 struct ActivityRunChip: View {
     let items: [Message]
-    /// Where an "Opened thread" chip inside the run goes once unfolded.
-    var openThread: ((ThreadRef) -> Void)? = nil
-    @Environment(\.colorScheme) private var colorScheme
-    @State private var expanded = false
 
-    private var running: Bool { items.contains { $0.tool?.ok == nil } }
-
-    private var summary: String {
-        running ? "Running \(items.count) steps" : "Ran \(items.count) steps"
-    }
-
-    private var isDark: Bool { colorScheme == .dark }
-    private var chipFill: Color { isDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05) }
-    private var chipStroke: Color { isDark ? Color.white.opacity(0.08) : Color.black.opacity(0.06) }
-    private var summaryColor: Color { isDark ? Color(hex: "#E2E8F0") : Color(hex: "#334155") }
+    /// The image keeps this glanceable: the last few steps, never the whole
+    /// tool history.
+    private var steps: [Message] { Array(items.suffix(4)) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            summaryButton
-            if expanded {
-                unfoldedSteps
+        if !steps.isEmpty {
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(steps, id: \.id) { item in
+                    HStack(spacing: 8) {
+                        glyph(item.tool?.ok)
+                        Text(item.tool?.displayLabel ?? "Working")
+                            .font(.system(size: 14))
+                            .foregroundStyle(item.tool?.ok == nil ? Color.primary : Color.secondary)
+                            .lineLimit(1)
+                    }
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                BubbleColor.theirs,
+                in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+            )
+            .padding(.trailing, 44)
+            .accessibilityElement(children: .combine)
         }
-        .padding(.leading, 2)
     }
 
-    private var summaryButton: some View {
-        Button {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { expanded.toggle() }
-            Haptics.selection()
-        } label: {
-            summaryLabel
+    @ViewBuilder
+    private func glyph(_ ok: Bool?) -> some View {
+        switch ok {
+        case .some(true):
+            Image(systemName: "checkmark")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 12)
+        case .some(false):
+            Image(systemName: "xmark")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.red)
+                .frame(width: 12)
+        case .none:
+            Circle()
+                .fill(Color.secondary)
+                .frame(width: 6, height: 6)
+                .frame(width: 12)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(summary)
-        .accessibilityHint(expanded ? "Hides the steps" : "Shows the steps")
+    }
+}
+
+
+extension ToolActivity {
+    /// What the monitor says, in a phrase rather than the computer's tool
+    /// name. The computer's own spoken phrase wins when it has one.
+    var displayLabel: String {
+        let text = rawDisplayLabel
+        guard let first = text.first else { return text }
+        return first.uppercased() + text.dropFirst()
     }
 
-    private var summaryLabel: some View {
-        HStack(spacing: 6) {
-            Image(systemName: running ? "ellipsis.circle" : "checkmark.seal.fill")
-                .font(.system(size: 11))
-                .foregroundColor(running ? Color.secondary : Color(hex: "#22C55E"))
-
-            Text(summary)
-                .font(.caption2.weight(.bold))
-                .foregroundColor(summaryColor)
-
-            Image(systemName: "chevron.right")
-                .font(.system(size: 8, weight: .bold))
-                .foregroundColor(Color.secondary)
-                .rotationEffect(.degrees(expanded ? 90 : 0))
+    private var rawDisplayLabel: String {
+        if let spoken, !spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return spoken
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 4.5)
-        .background(chipFill)
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(chipStroke, lineWidth: 0.5))
-    }
-
-    private var unfoldedSteps: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(items, id: \.id) { item in
-                ActivityChip(
-                    tool: item.tool, threadRef: item.threadRef, openThread: openThread,
-                    outputIsProse: item.isTeammateReport
-                )
-            }
+        if let cause = failedTurnCause(name) { return cause }
+        if name.hasPrefix("notice:") {
+            return String(name.dropFirst("notice:".count)).trimmingCharacters(in: .whitespaces)
         }
-        .transition(.opacity.combined(with: .move(edge: .top)))
+        switch name.lowercased() {
+        case "execute", "bash", "shell", "run_command", "command", "terminal":
+            return "Running a command"
+        case "read", "read_file", "open_file", "view_file":
+            return "Reading a file"
+        case "write", "write_file", "create_file":
+            return "Writing a file"
+        case "edit", "edit_file", "apply_patch", "str_replace", "multi_edit":
+            return "Editing a file"
+        case "grep", "search", "search_files", "find":
+            return "Searching files"
+        case "glob", "list_files", "ls":
+            return "Listing files"
+        case "web_search", "search_web", "websearch":
+            return "Searching the web"
+        case "web_fetch", "fetch", "open_url", "browse_url":
+            return "Reading a webpage"
+        case "browser":
+            return "Using the browser"
+        case "screenshot":
+            return "Taking a screenshot"
+        case "memory_update", "memory":
+            return "Updating memory"
+        case "attach_file", "attach":
+            return "Attaching a file"
+        case "send_message", "message":
+            return "Sending a message"
+        case "composio", "composio_search", "connect":
+            return "Searching connected apps"
+        case "task", "spawn_agent", "agent", "delegate":
+            return "Starting a helper"
+        case "skill", "skill_execution":
+            return "Running a skill"
+        default:
+            let humanised = name
+                .replacingOccurrences(of: "_", with: " ")
+                .replacingOccurrences(of: "-", with: " ")
+                .trimmingCharacters(in: .whitespaces)
+            guard let first = humanised.first else { return "Working" }
+            return first.uppercased() + humanised.dropFirst()
+        }
     }
 }
